@@ -1,0 +1,34 @@
+{
+  "circuit": "Austin",
+  "year": 2024,
+  "pit_loss_s": 21.14,
+  "fuel_burn_rate_kg_per_lap": 1.5,
+  "fuel_effect_s_per_kg": 0.05,
+  "sc_probability": 0.0,
+  "tyre_cliff_soft": 999.0,
+  "tyre_cliff_medium": 999.0,
+  "tyre_cliff_hard": 999.0,
+  "base_pace_s": 99.404,
+  "degradation": {
+    "MEDIUM": [
+      0.02649,
+      0.0,
+      999.0
+    ],
+    "HARD": [
+      0.04951,
+      0.0,
+      999.0
+    ]
+  },
+  "compound_offset": {
+    "MEDIUM": 1.6765,
+    "HARD": 0.0
+  },
+  "compound_offset_agreement": 0.789,
+  "compound_offset_samples": 19,
+  "degradation_max_age": 39,
+  "fit_residual_rms_s": 0.9629,
+  "fit_laps_used": 955,
+  "source": "fitted from OpenF1 session 9617"
+}

@@ -1,0 +1,205 @@
+@import "tailwindcss";
+
+/* The theme is driven by a data attribute rather than the operating system,
+   so the user can switch it from the settings button. */
+@custom-variant light (&:where([data-theme='light'], [data-theme='light'] *));
+
+/* ---------------------------------------------------------------------------
+   Theme
+   Tailwind v4 does not ship these, so they are defined here rather than
+   silently doing nothing.
+--------------------------------------------------------------------------- */
+
+:root,
+[data-theme='dark'] {
+  --pw-bg: #020205;
+  --pw-surface: #09090b;
+  --pw-surface-2: #111113;
+  --pw-border: #27272a;
+  --pw-border-soft: #1c1c1f;
+  --pw-text: #e4e4e7;
+  --pw-text-strong: #ffffff;
+  --pw-text-muted: #a1a1aa;
+  --pw-text-dim: #52525b;
+  --pw-accent: #e10600;
+  --pw-grid: rgba(239, 68, 68, 0.08);
+}
+
+[data-theme='light'] {
+  --pw-bg: #f4f4f5;
+  --pw-surface: #ffffff;
+  --pw-surface-2: #fafafa;
+  --pw-border: #d4d4d8;
+  --pw-border-soft: #e4e4e7;
+  --pw-text: #27272a;
+  --pw-text-strong: #09090b;
+  --pw-text-muted: #52525b;
+  --pw-text-dim: #a1a1aa;
+  --pw-accent: #e10600;
+  --pw-grid: rgba(225, 6, 0, 0.07);
+}
+
+/* The app's surfaces read from these variables, so a theme change is
+   instant and does not need every component to be re-written. */
+html,
+body {
+  background-color: var(--pw-bg);
+  color: var(--pw-text);
+}
+
+.pw-app {
+  background-color: var(--pw-bg);
+  color: var(--pw-text);
+}
+
+.pw-surface {
+  background-color: var(--pw-surface);
+  border-color: var(--pw-border);
+}
+
+.pw-surface-2 {
+  background-color: var(--pw-surface-2);
+  border-color: var(--pw-border-soft);
+}
+
+.pw-text {
+  color: var(--pw-text);
+}
+
+.pw-text-strong {
+  color: var(--pw-text-strong);
+}
+
+.pw-text-muted {
+  color: var(--pw-text-muted);
+}
+
+.pw-text-dim {
+  color: var(--pw-text-dim);
+}
+
+.pw-border {
+  border-color: var(--pw-border);
+}
+
+.pw-border-soft {
+  border-color: var(--pw-border-soft);
+}
+
+.pw-grid {
+  background-image: radial-gradient(var(--pw-grid) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+
+/* ---------------------------------------------------------------------------
+   Animations
+--------------------------------------------------------------------------- */
+
+@keyframes pitwall-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fadeIn {
+  animation: pitwall-fade-in 220ms ease-out both;
+}
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: #3f3f46 transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background-color: #3f3f46;
+  border-radius: 9999px;
+}
+
+.scrollbar-thumb-zinc-700 {
+  scrollbar-color: #3f3f46 transparent;
+}
+
+/* A flag out: the banner breathes so it cannot be missed. */
+@keyframes pitwall-flag-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(250, 204, 21, 0);
+  }
+  50% {
+    box-shadow: 0 0 26px -4px rgba(250, 204, 21, 0.55);
+  }
+}
+
+.animate-flag-pulse {
+  animation: pitwall-flag-pulse 1.8s ease-in-out infinite;
+}
+
+/* Rain over the weather strip. */
+@keyframes pitwall-rain {
+  0% {
+    transform: translateY(-20px);
+    opacity: 0;
+  }
+  15% {
+    opacity: 1;
+  }
+  85% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(120px);
+    opacity: 0;
+  }
+}
+
+.animate-rain {
+  animation: pitwall-rain linear infinite;
+}
+
+/* A slow drift for the "rain risk" haze. */
+@keyframes pitwall-drift {
+  0% {
+    transform: translateX(-12%);
+    opacity: 0;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(12%);
+    opacity: 0;
+  }
+}
+
+.animate-drift {
+  animation: pitwall-drift 4.5s ease-in-out infinite;
+}
+
+/* A gentle breathing glow for the live indicators. */
+@keyframes pitwall-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+.animate-breathe {
+  animation: pitwall-breathe 2.4s ease-in-out infinite;
+}

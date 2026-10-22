@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+/cache/
+/data/cache/
+/data/raw/
+/data/parquet/
+*.duckdb
+*.db
+*.egg-info/
+
+# Frontend dependencies and build output
+web/node_modules/
+web/dist/
+web/.env.local
+
+# LiveF1 diagnostic log
+livef1.log
