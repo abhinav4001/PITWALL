@@ -23,3 +23,7 @@ web/.env.local
 
 # LiveF1 diagnostic log
 livef1.log
+
+# Internal build notes, kept locally but never published
+/*_HANDOFF.md
+/FRONTEND_REDESIGN_PROMPT.md
