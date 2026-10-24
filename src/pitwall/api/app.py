@@ -338,6 +338,15 @@ class PitWallState:
         """
         self._hub_failures = min(self._hub_failures + 1, 5)
         delay = min(300.0, 15.0 * 2 ** (self._hub_failures - 1))
+        # Around a session's start a five-minute wait could cost the first
+        # laps, so the wait is cut short when the calendar says the session
+        # is due.
+        now = datetime.now(UTC)
+        start = self._next_session_at
+        if start is not None and (
+            start - timedelta(minutes=5) <= now <= start + timedelta(minutes=60)
+        ):
+            delay = min(delay, 45.0)
         self._hub_next_try = time.monotonic() + delay
         logger.info(
             "livetiming hub is not reachable: %s (trying again in %.0fs)",
