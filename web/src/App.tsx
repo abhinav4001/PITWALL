@@ -579,7 +579,7 @@ export default function PitWallApp() {
             {[
               {
                 title: 'Live car positions',
-                body: 'Every car plotted on the real circuit outline from OpenF1 GPS, in its team colour, updated as the session runs.',
+                body: 'Cars plotted on the real circuit outline whenever F1 publishes positions, in team colour. When it does not, the map shows the outline and says so.',
               },
               {
                 title: 'Real strategy',
@@ -905,7 +905,11 @@ export default function PitWallApp() {
                     <span className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse" />
                     <span className="text-xs font-mono font-black text-zinc-200 light:text-zinc-800 uppercase tracking-widest">
                       {circuitFacts.circuit} Circuit —{' '}
-                      {session?.mode === 'LIVE' ? 'Live positions' : 'GPS Telemetry Map'}
+                      {session?.mode === 'LIVE'
+                        ? hasPositions
+                          ? 'Live positions'
+                          : 'Live session'
+                        : 'GPS Telemetry Map'}
                     </span>
                   </div>
                   <span className="text-xs font-mono px-3 py-1 rounded bg-zinc-900 light:bg-zinc-100 text-emerald-400 border border-zinc-800 light:border-zinc-200 font-bold">
@@ -975,7 +979,12 @@ export default function PitWallApp() {
               <TyreWidget
                 tyre={strategy?.tyre ?? null}
                 available={Boolean(strategy?.available && strategy?.tyre)}
-                reason={strategy?.reason}
+                reason={
+                  strategy?.reason ??
+                  (session?.mode === 'LIVE'
+                    ? 'No degradation model for this circuit and season. The live compound and age are in the timing tower.'
+                    : undefined)
+                }
               />
               <WeatherStrip weather={weather} />
               <RadioPanel radio={radio} driverCodes={driverCodes} />
