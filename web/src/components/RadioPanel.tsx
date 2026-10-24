@@ -37,6 +37,7 @@ function durationOf(seconds: number): string {
  */
 export function RadioPanel({ radio, driverCodes }: RadioPanelProps) {
   const messages = radio?.messages ?? []
+  const total = radio?.count ?? messages.length
   const available = Boolean(radio?.available) && messages.length > 0
   const audio = useRef<HTMLAudioElement | null>(null)
   const [playing, setPlaying] = useState<string | null>(null)
@@ -90,7 +91,9 @@ export function RadioPanel({ radio, driverCodes }: RadioPanelProps) {
         </span>
         {available && (
           <span className="font-mono text-[10px] font-black uppercase text-zinc-500">
-            {messages.length} {messages.length === 1 ? 'call' : 'calls'} · UTC
+            {total > messages.length
+              ? `latest ${messages.length} of ${total} · UTC`
+              : `${messages.length} ${messages.length === 1 ? 'call' : 'calls'} · UTC`}
           </span>
         )}
       </div>
