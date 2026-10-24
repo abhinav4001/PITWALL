@@ -23,3 +23,7 @@ web/.env.local
 
 # LiveF1 diagnostic log
 livef1.log
+
+# Local backend logs
+backend.log
+backend.err.log

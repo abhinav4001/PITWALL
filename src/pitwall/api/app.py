@@ -106,6 +106,11 @@ def _unavailable(reason: str, **extra: Any) -> dict[str, Any]:
     return {"available": False, "reason": reason, "source": "unavailable", **extra}
 
 
+def _source_name() -> str:
+    """Where the frame on screen comes from, for traceability."""
+    return "livetiming.hub" if state.mode == "LIVE" else "openf1"
+
+
 def _optional(source: Any, name: str, *args: Any) -> Any:
     """Call a helper the source may not have.
 
@@ -375,6 +380,14 @@ class PitWallState:
                 logger.warning("livetiming connect failed: %s", exc)
                 self._hub_failed()
                 return False
+            # ``connect`` returns as soon as the subscription is accepted.
+            # The session snapshot arrives in the Subscribe completion, so
+            # give it a moment before deciding whether a session is running;
+            # otherwise a live session is missed until the next watcher tick.
+            for _ in range(20):
+                if source.state.session:
+                    break
+                await asyncio.sleep(0.1)
 
         if not source.connected:
             self._hub_failed()
@@ -552,7 +565,6 @@ class PitWallState:
         that starts while the app is open is picked up without a restart.
         """
         while True:
-            await asyncio.sleep(interval)
             try:
                 if self.mode == "LIVE":
                     # The live track fills in as the cars circulate, so the
@@ -562,11 +574,12 @@ class PitWallState:
                         await self._back_to_replay()
                     else:
                         self._rebuild_live_geometry()
-                    continue
-                await self._check_for_live_session()
-                await self._refresh_a_silent_hub()
+                else:
+                    await self._check_for_live_session()
+                    await self._refresh_a_silent_hub()
             except Exception as exc:  # noqa: BLE001 - the watcher must survive
                 logger.warning("live session check failed: %s", exc)
+            await asyncio.sleep(interval)
 
     async def _refresh_a_silent_hub(self) -> None:
         """Reopen a subscription the hub may never push a new session to.
@@ -937,29 +950,30 @@ async def current_outline() -> dict[str, Any]:
 
     if state.mode == "LIVE":
         trace = state._live_trace  # noqa: SLF001 - same package
-        if len(trace) < 10:
-            return _unavailable(
-                "track_still_building",
-                mode=state.mode,
-                points=len(trace),
-                circuit=state.circuit,
-            )
-        return {
-            "available": True,
-            "source": "livetiming.positions",
-            "circuit": state.circuit,
-            "year": state.year,
-            "points": [
-                {"x": projection.project(x, y)[0], "y": projection.project(x, y)[1]}
-                for x, y in trace
-            ],
-            "raw_points": [{"x": x, "y": y} for x, y in trace],
-            "corners": [],
-            "start_finish": None,
-            "view_box": {"width": projection.view_width, "height": projection.view_height},
-            "projection": projection.as_dict(),
-            "metadata": {"point_count": len(trace)},
-        }
+        if len(trace) >= 10:
+            return {
+                "available": True,
+                "source": "livetiming.positions",
+                "circuit": state.circuit,
+                "year": state.year,
+                "points": [
+                    {"x": projection.project(x, y)[0], "y": projection.project(x, y)[1]}
+                    for x, y in trace
+                ],
+                "raw_points": [{"x": x, "y": y} for x, y in trace],
+                "corners": [],
+                "start_finish": None,
+                "view_box": {
+                    "width": projection.view_width,
+                    "height": projection.view_height,
+                },
+                "projection": projection.as_dict(),
+                "metadata": {"point_count": len(trace)},
+            }
+        # The free feed is not publishing car positions for this session, so
+        # there is no driven path to trace.  Show the real circuit outline
+        # instead of an empty box; the UI says plainly that the cars are not
+        # placed, and nothing is invented.
 
     outline = state.outline
     if not outline:
@@ -967,6 +981,13 @@ async def current_outline() -> dict[str, Any]:
     return {
         "available": True,
         "source": outline.get("source"),
+        "mode": state.mode,
+        "note": (
+            "F1's free feed is not publishing car positions; showing the "
+            "circuit outline only."
+            if state.mode == "LIVE"
+            else None
+        ),
         "circuit": outline.get("circuit", state.circuit),
         "year": outline.get("year", state.year),
         "points": [
@@ -1026,7 +1047,7 @@ async def drivers(session_key: int | None = None) -> dict[str, Any]:
         return _unavailable("no_replay_session_cached")
     return {
         "available": True,
-        "source": "openf1",
+        "source": _source_name(),
         "session_key": state.replayer.session_key,
         "drivers": state.replayer.drivers,
     }
@@ -1052,7 +1073,7 @@ async def positions(
             state.loop.add_lookahead(payload)
     return {
         "available": True,
-        "source": "openf1",
+        "source": _source_name(),
         "session_key": payload["session_key"],
         "timestamp": payload["timestamp"],
         "elapsed_s": payload["elapsed_s"],
@@ -1084,7 +1105,7 @@ async def telemetry(
             )
     return {
         "available": True,
-        "source": "openf1",
+        "source": _source_name(),
         "timestamp": frame.timestamp.isoformat(),
         "elapsed_s": round(frame.elapsed_s, 3),
         "telemetry": [d.to_dict() for d in selected],
@@ -1103,7 +1124,7 @@ async def timing(at: float | None = None) -> dict[str, Any]:
         payload = project_frame(frame, state.projection)
     return {
         "available": True,
-        "source": "openf1",
+        "source": _source_name(),
         "timestamp": payload["timestamp"],
         "elapsed_s": payload["elapsed_s"],
         "flag_state": payload["flag_state"],
@@ -1263,7 +1284,9 @@ async def live_status() -> dict[str, Any]:
         }
         if session
         else None,
-        "drivers": len(source_state.cars),
+        "drivers": len(
+            source_state.drivers or source_state.timing or source_state.cars
+        ),
         "radio_calls": len(source_state.radio),
         "weather_reports": len(source_state.weather),
         "messages": len(source_state.messages),

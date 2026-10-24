@@ -177,7 +177,7 @@ export default function PitWallApp() {
       if (data.pitwall) setStrategy(data.pitwall)
       setSelectedDriver((current) => {
         if (current !== null) return current
-        const first = data.drivers.find((d) => d.on_track)
+        const first = data.drivers.find((d) => d.on_track) ?? data.drivers[0]
         return first ? first.driver_number : null
       })
     }
@@ -331,6 +331,10 @@ export default function PitWallApp() {
 
   // ------------------------------------------------------------- selectors
   const drivers = useMemo(() => smoothDrivers, [smoothDrivers])
+  const hasPositions = useMemo(
+    () => drivers.some((d) => d.x !== null && d.y !== null),
+    [drivers],
+  )
   const selected = useMemo(
     () => drivers.find((d) => d.driver_number === selectedDriver) ?? null,
     [drivers, selectedDriver],
@@ -392,7 +396,9 @@ export default function PitWallApp() {
     return {
       circuit: String(meta.circuit_short_name ?? session?.circuit ?? 'Austin'),
       year: Number(meta.year ?? session?.year ?? 2024),
-      name: String(meta.session_name ?? 'Race'),
+      name: String(
+        meta.session_name ?? session?.meeting_name ?? session?.session_type ?? 'Race',
+      ),
       start: String(meta.date_start ?? ''),
     }
   }, [frame, session])
@@ -903,7 +909,9 @@ export default function PitWallApp() {
                     </span>
                   </div>
                   <span className="text-xs font-mono px-3 py-1 rounded bg-zinc-900 light:bg-zinc-100 text-emerald-400 border border-zinc-800 light:border-zinc-200 font-bold">
-                    {drivers.filter((d) => d.on_track).length} CARS ON TRACK
+                    {session?.mode === 'LIVE' && !hasPositions
+                      ? 'LIVE POSITIONS UNAVAILABLE'
+                      : `${drivers.filter((d) => d.on_track).length} CARS ON TRACK`}
                   </span>
                 </div>
                 {outline ? (
@@ -920,10 +928,17 @@ export default function PitWallApp() {
                   <Unavailable
                     reason={
                       session?.mode === 'LIVE'
-                        ? 'Building the track from the live positions…'
+                        ? "Live car positions are not available from F1's free feed."
                         : 'Circuit outline unavailable'
                     }
                   />
+                )}
+                {session?.mode === 'LIVE' && !hasPositions && (
+                  <p className="mt-3 font-mono text-[11px] leading-relaxed text-zinc-500 light:text-zinc-500">
+                    Timing, tyres, gaps and radio are live from F1&apos;s feed.
+                    This feed is not publishing car positions, so the map
+                    cannot place the cars.
+                  </p>
                 )}
                 {drivers.length > 0 && (
                   <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1.5 font-mono text-[10px] text-zinc-500 light:text-zinc-500">
@@ -1006,6 +1021,13 @@ export default function PitWallApp() {
                         brake={selected.brake}
                       />
                     </div>
+
+                    {session?.mode === 'LIVE' && selected.speed === null && (
+                      <p className="text-[11px] leading-relaxed text-zinc-500 light:text-zinc-500">
+                        F1&apos;s free feed is not publishing car telemetry for
+                        this session.
+                      </p>
+                    )}
 
                     <div className="pt-1 text-xs text-zinc-500 light:text-zinc-500 font-bold">
                       {selected.name} • {selected.team} • Lap {selected.lap ?? '—'}

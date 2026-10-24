@@ -12,6 +12,7 @@ established from FastF1's reference client:
 import base64
 import json
 import zlib
+from datetime import UTC
 
 import pytest
 
@@ -22,6 +23,8 @@ from pitwall.realtime.livetiming import (
     LivetimingLiveAdapter,
     LivetimingLiveSource,
     _decode,
+    _parse_hub_time,
+    session_is_running,
 )
 
 
@@ -37,6 +40,22 @@ def _frame(topic: str, payload: dict) -> str:
     """One SignalR invocation frame, compressed if the topic is a ``.z``."""
     body = _zipped(payload) if topic.endswith(".z") else json.dumps(payload)
     return json.dumps({"type": 1, "target": topic, "arguments": [body]})
+
+
+def _feed(topic: str, payload: dict) -> str:
+    """One incremental hub update, exactly as the live feed sends it.
+
+    The topic is the *first argument* of a ``feed`` invocation, not the
+    target; getting this wrong silently discards every update after the
+    initial snapshot.
+    """
+    return json.dumps(
+        {
+            "type": 1,
+            "target": "feed",
+            "arguments": [topic, payload, "2026-10-24T17:45:00.000Z"],
+        }
+    )
 
 
 def _completion(snapshot: dict[str, dict]) -> str:
@@ -670,3 +689,155 @@ def test_the_track_outline_is_the_path_the_cars_drove() -> None:
     bounds = source.bounds()
     assert bounds is not None
     assert bounds[0] == 0.0 and bounds[1] == 40.0
+
+
+def test_feed_envelope_routes_the_topic_and_payload() -> None:
+    source = LivetimingLiveSource()
+    source._handle(
+        _feed(
+            "TimingData",
+            {
+                "Lines": {
+                    "1": {
+                        "RacingNumber": "1",
+                        "Position": "1",
+                        "NumberOfLaps": 5,
+                        "TimeDiffToFastest": "",
+                        "TimeDiffToPositionAhead": "+0.321",
+                        "LastLapTime": {"Value": "1:35.962"},
+                    }
+                }
+            },
+        )
+    )
+
+    assert source.state.topics["TimingData"] == 1
+    assert source.state.timing[1]["position"] == 1
+    assert source.state.timing[1]["interval_to_ahead"] == 0.321
+    assert source.state.timing[1]["last_lap"] == 95.962
+
+
+def test_driver_list_is_a_direct_mapping_on_the_live_feed() -> None:
+    source = LivetimingLiveSource()
+    source._handle(
+        _feed(
+            "DriverList",
+            {
+                "1": {
+                    "RacingNumber": "1",
+                    "Tla": "VER",
+                    "FullName": "Max VERSTAPPEN",
+                    "TeamName": "Red Bull Racing",
+                    "TeamColour": "4781D7",
+                }
+            },
+        )
+    )
+
+    driver = source.state.drivers[1]
+    assert driver["code"] == "VER"
+    assert driver["name"] == "Max VERSTAPPEN"
+    assert driver["team"] == "Red Bull Racing"
+
+
+def test_session_info_string_status_becomes_a_running_status() -> None:
+    source = LivetimingLiveSource()
+    source._on_SessionInfo(
+        {
+            "Key": 11391,
+            "Name": "Practice 3",
+            "SessionStatus": "Started",
+            "StartDate": "2026-10-24T12:30:00",
+            "EndDate": "2026-10-24T13:30:00",
+            "GmtOffset": "-05:00:00",
+        }
+    )
+    source._handle(_feed("SessionStatus", {"Status": "Started", "Started": "Started"}))
+
+    assert isinstance(source.state.session["SessionStatus"], dict)
+    assert session_is_running(source.state.session) is True
+
+
+def test_stints_are_an_ordered_list_on_the_live_feed() -> None:
+    source = LivetimingLiveSource()
+    source._handle(
+        _feed(
+            "TimingAppData",
+            {
+                "Lines": {
+                    "1": {
+                        "RacingNumber": "1",
+                        "Stints": [
+                            {"Compound": "SOFT", "TotalLaps": 2, "StartLaps": 0},
+                            {"Compound": "MEDIUM", "TotalLaps": 4, "StartLaps": 0},
+                        ],
+                    }
+                }
+            },
+        )
+    )
+
+    assert source.state.tyres[1]["compound"] == "MEDIUM"
+    assert source.state.tyres[1]["total_laps"] == 4
+
+
+def test_live_weather_values_are_numbers_not_strings() -> None:
+    source = LivetimingLiveSource()
+    source._handle(
+        _feed(
+            "WeatherData",
+            {
+                "AirTemp": "26.9",
+                "TrackTemp": "41.0",
+                "Humidity": "50.5",
+                "Pressure": "1004.0",
+                "WindSpeed": "2.3",
+                "WindDirection": "116",
+                "Rainfall": "0",
+            },
+        )
+    )
+
+    report = source.state.weather[-1]
+    assert report["air_temperature"] == 26.9
+    assert report["track_temperature"] == 41.0
+    assert report["rainfall"] == 0.0
+    assert report["date"]
+
+
+def test_live_radio_captures_keep_the_official_audio_path() -> None:
+    source = LivetimingLiveSource()
+    source.state.session["Path"] = (
+        "2026/2026-10-25_United_States_Grand_Prix/2026-10-24_Practice_3/"
+    )
+    source._handle(
+        _feed(
+            "TeamRadio",
+            {
+                "Captures": [
+                    {
+                        "Utc": "2026-10-24T17:35:06.8212045Z",
+                        "RacingNumber": "43",
+                        "Path": "TeamRadio/COL_43_20261024_123506.mp3",
+                    }
+                ]
+            },
+        )
+    )
+
+    assert len(source.state.radio) == 1
+    assert source.state.radio[0]["driver_number"] == 43
+    # The clip path is relative to the session archive; the session prefix is
+    # what makes the static URL resolve instead of answering 403.
+    assert source.state.radio[0]["recording_url"].endswith(
+        "2026/2026-10-25_United_States_Grand_Prix/2026-10-24_Practice_3/"
+        "TeamRadio/COL_43_20261024_123506.mp3"
+    )
+
+
+def test_hub_session_time_applies_the_gmt_offset() -> None:
+    moment = _parse_hub_time("2026-10-24T12:30:00", "-05:00:00")
+
+    assert moment is not None
+    utc = moment.astimezone(UTC)
+    assert (utc.hour, utc.minute) == (17, 30)

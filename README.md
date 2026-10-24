@@ -1,6 +1,6 @@
 # PitWall
 
-A real-time Formula 1 pit wall: live timing, car positions, telemetry, tyre strategy, team radio, weather and race control, built from real session data.
+A real-time Formula 1 pit wall: live timing, tyre strategy, team radio, weather and race control, built from real session data. Car positions and telemetry are shown whenever F1's feed publishes them.
 
 PitWall is not a race simulator. It follows the official F1 live timing feed when a session is running and falls back to a cached race replay when nothing is on track. Every number comes from a real source; when a value is not available, the UI says so instead of inventing one.
 
@@ -8,9 +8,9 @@ PitWall is not a race simulator. It follows the official F1 live timing feed whe
 
 ## What it does
 
-- **Live timing** - positions, gaps, intervals, laps, sectors and race status from F1's own SignalR hub (`livetiming.formula1.com/signalrcore`).
-- **Live track map** - car positions drawn from the feed's own X/Y coordinates. While a live session is starting, the outline is built from the path the cars actually drive.
-- **Telemetry** - speed, throttle, brake, gear, RPM and DRS for the selected driver.
+- **Live timing** - order, gaps, intervals, laps, sectors, tyres and race status from F1's own SignalR hub (`livetiming.formula1.com/signalrcore`).
+- **Live track map** - car positions drawn from the feed's own X/Y coordinates when it publishes them. When it does not, the map shows the real circuit outline and says plainly that the cars cannot be placed.
+- **Telemetry** - speed, throttle, brake, gear, RPM and DRS for the selected driver when the feed carries `CarData`.
 - **Strategy** - tyre life, degradation, pit loss and a ranked stop plan. The main question is answered directly: if this driver pits now, where do they come out relative to the cars around them?
 - **Tyres** - the compound the driver is actually on, its age, and a lap-by-lap degradation projection. The compound never flips to another tyre.
 - **Radio** - the official F1 team radio audio, played as each call arrives. No machine transcripts.
@@ -22,9 +22,10 @@ PitWall is not a race simulator. It follows the official F1 live timing feed whe
 
 | Data | Source |
 |---|---|
-| Live timing, positions, telemetry, weather, radio, race control | F1 live timing hub (`/signalrcore`) |
+| Live timing, tyres, weather, radio, race control | F1 live timing hub (`/signalrcore`) |
+| Live positions and telemetry | F1 live timing hub, when it publishes `Position.z` / `CarData.z` |
 | Historical race replay | OpenF1 session packs |
-| Circuit outlines | FastF1 circuit data and live position traces |
+| Circuit outlines | FastF1 / OpenF1 circuit data and live position traces |
 | Championship standings | Published 2026 season figures |
 
 The live hub is free and unauthenticated. It throttles repeated connections, so the backend backs off and reconnects by itself rather than retrying aggressively.
@@ -150,6 +151,7 @@ docs/           Architecture notes, measurements and verification log
 ## Notes and limitations
 
 - Live data is only available while a real F1 session is running.
+- The free live feed does not always publish car positions (`Position.z`) or telemetry (`CarData.z`). During 2026 Practice 3 at Austin it published neither. PitWall keeps the timing, tyres, gaps, radio and weather live, and says on the map and telemetry card that the cars cannot be placed rather than inventing coordinates.
 - The live hub is unofficial in the sense that it is the same endpoint F1's website uses; its availability and throttling are outside this project's control.
 - Strategy requires a calibration bundle. Without one, PitWall reports "unavailable" instead of a forecast.
 - Team radio is audio only. F1's recordings are played directly; no speech recognition is used.

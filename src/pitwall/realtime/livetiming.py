@@ -44,7 +44,7 @@ import logging
 import time
 import zlib
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote
 
@@ -182,12 +182,48 @@ def _parse_utc(value: Any) -> datetime | None:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
-def _radio_url(path: Any) -> str | None:
+def _gmt_offset(value: Any) -> timezone | None:
+    """Parse the hub's ``"-05:00:00"`` offset into a timezone."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    sign = -1 if text.startswith("-") else 1
+    parts = text.lstrip("+-").split(":")
+    try:
+        hours = int(parts[0])
+        minutes = int(parts[1]) if len(parts) > 1 else 0
+    except (IndexError, ValueError):
+        return None
+    return timezone(sign * timedelta(hours=hours, minutes=minutes))
+
+
+def _parse_hub_time(value: Any, gmt_offset: Any = None) -> datetime | None:
+    """Parse a hub timestamp, applying its GMT offset when the time is naive.
+
+    ``SessionInfo`` publishes the local start and end (for example
+    ``12:30:00`` in Austin) together with ``GmtOffset: "-05:00:00"``.  Treating
+    the naive time as UTC puts the session five hours out of place, which is
+    enough to make a running session look finished.
+    """
+    if not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is not None:
+        return moment
+    return moment.replace(tzinfo=_gmt_offset(gmt_offset) or UTC)
+
+
+def _radio_url(path: Any, session_path: Any = None) -> str | None:
     """The playable address of a radio clip.
 
-    The hub sends a path relative to its static archive (for example
-    ``2026/.../TeamRadio/VER01_1_...mp3``); the browser can play that
-    directly.  A path that is already absolute is left alone.
+    The hub sends a path relative to the **session archive**, for example
+    ``TeamRadio/VER01_1_...mp3`` while the session itself lives at
+    ``2026/.../2026-10-24_Practice_3/``.  Both parts are needed: without the
+    session prefix the static archive answers HTTP 403.  A path that is
+    already absolute is left alone.
     """
     if not isinstance(path, str) or not path.strip():
         return None
@@ -195,6 +231,9 @@ def _radio_url(path: Any) -> str | None:
     if path.startswith(("http://", "https://")):
         return path
     path = path.lstrip("/")
+    prefix = str(session_path or "").strip("/")
+    if prefix and path != prefix and not path.startswith(f"{prefix}/"):
+        path = f"{prefix}/{path}"
     if path.startswith("static/"):
         path = path[len("static/") :]
     return f"{STATIC_BASE}/{path}"
@@ -217,8 +256,13 @@ def session_is_running(session: dict[str, Any], now: datetime | None = None) -> 
     """
     if not session or not session.get("Key"):
         return False
-    status = session.get("SessionStatus") or {}
-    value = str(status.get("Status") or "").strip().lower() if isinstance(status, dict) else ""
+    status = session.get("SessionStatus")
+    if isinstance(status, dict):
+        value = str(status.get("Status") or "").strip().lower()
+    else:
+        # ``SessionInfo`` carries a plain string ("Started"); the separate
+        # ``SessionStatus`` topic carries the richer object.  Both are valid.
+        value = str(status or "").strip().lower()
     if value in RUNNING_STATUSES:
         return True
     if value in ENDED_STATUSES:
@@ -227,8 +271,9 @@ def session_is_running(session: dict[str, Any], now: datetime | None = None) -> 
     # session that starts early still count, and a race that overruns still
     # count while it is being run.
     moment = now or datetime.now(UTC)
-    start = _parse_utc(session.get("StartDate"))
-    end = _parse_utc(session.get("EndDate"))
+    offset = session.get("GmtOffset")
+    start = _parse_hub_time(session.get("StartDate"), offset)
+    end = _parse_hub_time(session.get("EndDate"), offset)
     if start is None or end is None:
         return False
     return start - timedelta(minutes=15) <= moment <= end + timedelta(minutes=45)
@@ -337,6 +382,9 @@ class LivetimingLiveSource:
         self._ws: Any = None
         self._reader: asyncio.Task[None] | None = None
         self._pinger: asyncio.Task[None] | None = None
+        #: The load-balancer affinity cookie the hub sets on the negotiate
+        #: request.  The WebSocket upgrade is answered with 404 without it.
+        self._cookie_header: str = ""
         self._stop = asyncio.Event()
         self._attempted_at: float = 0.0
         self._backoff: float = reconnect_delay
@@ -350,14 +398,30 @@ class LivetimingLiveSource:
     # connection
     # ------------------------------------------------------------------
     async def _negotiate(self) -> str:
-        """Ask the hub for a connection token."""
+        """Ask the hub for a connection token and its affinity cookie.
+
+        The hub sits behind an AWS load balancer.  The negotiate request sets
+        an ``AWSALBCORS`` cookie, and the WebSocket upgrade must be sent to the
+        same backend with that cookie.  Without it the upgrade is answered
+        with HTTP 404, which looks exactly like the endpoint being wrong or
+        the connection budget being spent.
+        """
         async with httpx.AsyncClient(timeout=30.0, headers=_HEADERS) as client:
+            # OPTIONS is answered with 405, but it is what sets the cookie.
+            try:
+                await client.options(f"{HUB_BASE}/negotiate")
+            except httpx.HTTPError:
+                pass
+
             response = await client.post(
                 f"{HUB_BASE}/negotiate?negotiateVersion=1",
                 content=b"[]",
                 headers={**_HEADERS, "Content-Type": "application/json"},
             )
             response.raise_for_status()
+            self._cookie_header = "; ".join(
+                f"{name}={value}" for name, value in client.cookies.items()
+            )
             return str(response.json()["connectionToken"])
 
     async def connect(self, *, min_interval: float = 30.0) -> bool:
@@ -382,10 +446,11 @@ class LivetimingLiveSource:
             return False
 
         url = f"{WS_BASE}?id={quote(token, safe='')}"
+        headers = dict(_HEADERS)
+        if self._cookie_header:
+            headers["Cookie"] = self._cookie_header
         try:
-            self._ws = await websockets.connect(
-                url, additional_headers={"Origin": "https://www.formula1.com"}
-            )
+            self._ws = await websockets.connect(url, additional_headers=headers)
         except Exception as exc:  # noqa: BLE001
             self.last_error = f"websocket refused: {exc}"
             logger.warning("livetiming: %s", self.last_error)
@@ -532,6 +597,12 @@ class LivetimingLiveSource:
         arguments = message.get("arguments") or []
         if not arguments:
             return
+        if topic == "feed" and len(arguments) >= 2:
+            # The hub's incremental updates are sent as
+            # {"target": "feed", "arguments": [<topic>, <payload>, <utc>]}.
+            # The topic is the first argument, not the target.
+            self._dispatch(str(arguments[0]), _decode(arguments[1]))
+            return
         self._dispatch(topic, _decode(arguments[0]))
 
     def _dispatch(self, topic: str, payload: Any) -> None:
@@ -577,10 +648,13 @@ class LivetimingLiveSource:
 
     def _on_SessionStatus(self, payload: dict[str, Any]) -> None:
         if payload:
-            self.state.session.setdefault("SessionStatus", {})
-            status = self.state.session["SessionStatus"]
-            if isinstance(status, dict):
-                status.update(payload)
+            # ``SessionInfo`` may already have put a plain string here; the
+            # status topic is richer, so replace it with a mergeable object.
+            status = self.state.session.get("SessionStatus")
+            if not isinstance(status, dict):
+                status = {}
+                self.state.session["SessionStatus"] = status
+            status.update(payload)
             self.state.session.update({k: v for k, v in payload.items() if k != "Status"})
 
     def _on_TrackStatus(self, payload: dict[str, Any]) -> None:
@@ -605,7 +679,18 @@ class LivetimingLiveSource:
     # drivers
     # ------------------------------------------------------------------
     def _on_DriverList(self, payload: dict[str, Any]) -> None:
-        for number, row in (payload.get("Entries") or {}).items():
+        # The live hub sends the list directly, keyed by racing number:
+        # ``{"1": {...}, "43": {...}}``.  Older snapshots wrapped it in an
+        # ``Entries`` object, so accept both shapes.
+        entries = payload.get("Entries")
+        if not isinstance(entries, dict):
+            entries = {
+                key: value
+                for key, value in payload.items()
+                if isinstance(value, dict)
+                and any(field in value for field in ("RacingNumber", "Tla", "FullName"))
+            }
+        for number, row in entries.items():
             try:
                 number = int(row.get("RacingNumber") or number)
             except (TypeError, ValueError):
@@ -726,19 +811,29 @@ class LivetimingLiveSource:
                     "stopped": row.get("Stopped", entry.get("stopped")),
                     "status": row.get("Status", entry.get("status")),
                     "last_lap": _seconds(
-                        (row.get("LastLap") or {}).get("Value", entry.get("last_lap"))
+                        (row.get("LastLapTime") or row.get("LastLap") or {}).get(
+                            "Value", entry.get("last_lap")
+                        )
                     ),
                     "best_lap": _seconds(
-                        (row.get("BestLap") or {}).get("Value", entry.get("best_lap"))
+                        (row.get("BestLapTime") or row.get("BestLap") or {}).get(
+                            "Value", entry.get("best_lap")
+                        )
                     ),
                     "interval_to_ahead": _seconds(
-                        (row.get("IntervalToAhead") or {}).get(
-                            "Value", entry.get("interval_to_ahead")
+                        row.get(
+                            "TimeDiffToPositionAhead",
+                            (row.get("IntervalToAhead") or {}).get(
+                                "Value", entry.get("interval_to_ahead")
+                            ),
                         )
                     ),
                     "interval_to_leader": _seconds(
-                        (row.get("IntervalToLeader") or {}).get(
-                            "Value", entry.get("interval_to_leader")
+                        row.get(
+                            "TimeDiffToFastest",
+                            (row.get("IntervalToLeader") or {}).get(
+                                "Value", entry.get("interval_to_leader")
+                            ),
                         )
                     ),
                     "pit_stop": (row.get("PitStop") or {}).get(
@@ -765,16 +860,21 @@ class LivetimingLiveSource:
             except (TypeError, ValueError):
                 continue
             stints = row.get("Stints")
-            if not isinstance(stints, dict) or not stints:
+            if isinstance(stints, list):
+                # The live feed sends the stints as an ordered list; the last
+                # one is the current stint.
+                latest = stints[-1] if stints else {}
+            elif isinstance(stints, dict) and stints:
+
+                def _order(item: tuple[str, Any]) -> float:
+                    try:
+                        return float(item[0])
+                    except (TypeError, ValueError):
+                        return -1.0
+
+                latest = max(stints.items(), key=_order)[1] or {}
+            else:
                 continue
-
-            def _order(item: tuple[str, Any]) -> float:
-                try:
-                    return float(item[0])
-                except (TypeError, ValueError):
-                    return -1.0
-
-            latest = max(stints.items(), key=_order)[1] or {}
             entry = self.state.tyres.setdefault(number, {})
             if latest.get("Compound"):
                 entry["compound"] = latest["Compound"]
@@ -799,15 +899,19 @@ class LivetimingLiveSource:
                 continue
             self.state.weather.append(
                 {
-                    "date": row.get("Utc") or row.get("TimeStamp"),
+                    "date": (
+                        row.get("Utc")
+                        or row.get("TimeStamp")
+                        or datetime.now(UTC).isoformat()
+                    ),
                     "session_key": row.get("SessionKey"),
-                    "air_temperature": row.get("AirTemp"),
-                    "track_temperature": row.get("TrackTemp"),
-                    "humidity": row.get("Humidity"),
-                    "pressure": row.get("Pressure"),
-                    "wind_speed": row.get("WindSpeed"),
-                    "wind_direction": row.get("WindDirection"),
-                    "rainfall": row.get("Rainfall"),
+                    "air_temperature": _number(row.get("AirTemp")),
+                    "track_temperature": _number(row.get("TrackTemp")),
+                    "humidity": _number(row.get("Humidity")),
+                    "pressure": _number(row.get("Pressure")),
+                    "wind_speed": _number(row.get("WindSpeed")),
+                    "wind_direction": _number(row.get("WindDirection")),
+                    "rainfall": _number(row.get("Rainfall")),
                     "track_status": row.get("TrackStatus"),
                 }
             )
@@ -823,6 +927,45 @@ class LivetimingLiveSource:
         words and the MP3 path are what matter, and a call that cannot be
         attributed is still shown rather than dropped.
         """
+        # The live hub sends the clips themselves, with no words:
+        # ``{"Captures": [{"Utc": ..., "RacingNumber": "43",
+        # "Path": "TeamRadio/..."}]}``.  They are still real radio calls, so
+        # they belong in the panel even though there is no caption to show.
+        captures = payload.get("Captures")
+        if isinstance(captures, list):
+            known_calls = {
+                (str(row.get("date") or ""), str(row.get("recording_url") or ""))
+                for row in self.state.radio
+            }
+            for row in captures:
+                if not isinstance(row, dict):
+                    continue
+                stamp = str(row.get("Utc") or row.get("TimeStamp") or "")
+                recording_url = _radio_url(
+                    row.get("Path"), self.state.session.get("Path")
+                )
+                if not stamp or not recording_url:
+                    continue
+                if (stamp, recording_url) in known_calls:
+                    continue
+                number = row.get("RacingNumber") or row.get("DriverNumber")
+                try:
+                    driver_number = int(str(number)) if number is not None else None
+                except (TypeError, ValueError):
+                    driver_number = None
+                self.state.radio.append(
+                    {
+                        "date": stamp,
+                        "driver_number": driver_number,
+                        "who": None,
+                        "text": "",
+                        "recording_url": recording_url,
+                    }
+                )
+                known_calls.add((stamp, recording_url))
+            self.state.radio.sort(key=lambda r: str(r.get("date") or ""))
+            del self.state.radio[:-400]
+
         captions = payload.get("Captions")
         if isinstance(captions, list):
             items = {str(i): row for i, row in enumerate(captions)}
@@ -869,7 +1012,9 @@ class LivetimingLiveSource:
             stamp = str(row.get("Utc") or key)
             who, _, spoken = text.partition(": ")
             spoken = spoken or text
-            recording_url = _radio_url(row.get("Path"))
+            recording_url = _radio_url(
+                row.get("Path"), self.state.session.get("Path")
+            )
             seen = known.get((stamp, spoken))
             if seen is not None:
                 # A later snapshot may carry the audio path the first one
@@ -1192,20 +1337,25 @@ class LivetimingLiveAdapter:
         )
 
     def _elapsed_s(self) -> float:
-        """How long the session has been running, from the hub's own clock."""
+        """How long the session has been running, from the hub's own clock.
+
+        ``SessionInfo`` gives a naive local start and a GMT offset; the hub's
+        ``ExtrapolatedClock`` gives the time left.  Subtracting the time left
+        from the published session length avoids having to reinterpret the
+        local start time, and it keeps ticking as the clock updates.
+        """
         session = self.source.state.session
-        status = session.get("SessionStatus") or {}
-        start = status.get("Started") if isinstance(status, dict) else None
-        start = start or session.get("StartDate")
-        if not start:
-            return 0.0
-        try:
-            started = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
-        except ValueError:
-            return 0.0
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=UTC)
-        return max(0.0, (datetime.now(UTC) - started).total_seconds())
+        offset = session.get("GmtOffset")
+        remaining = _seconds(self.source.state.clock.get("Remaining"))
+        start = _parse_hub_time(session.get("StartDate"), offset)
+        end = _parse_hub_time(session.get("EndDate"), offset)
+        if remaining is not None and start is not None and end is not None:
+            duration = (end - start).total_seconds()
+            if duration > 0:
+                return max(0.0, duration - remaining)
+        if start is not None:
+            return max(0.0, (datetime.now(UTC) - start).total_seconds())
+        return 0.0
 
     def recent_messages(self, limit: int = 8) -> list[dict[str, Any]]:
         """The most recent race-control messages."""
