@@ -27,9 +27,9 @@
     ]
   },
   "compound_offset": {
-    "MEDIUM": 1.2695,
     "HARD": 2.1045,
-    "SOFT": 0.0
+    "SOFT": 0.0,
+    "MEDIUM": 1.2695
   },
   "compound_offset_agreement": 0.0,
   "compound_offset_samples": 2,

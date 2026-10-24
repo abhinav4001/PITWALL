@@ -80,41 +80,58 @@ export default function PitWallApp() {
   // ---------------------------------------------------------------- load
   useEffect(() => {
     let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
 
-    const load = async () => {
-      const [sessionData, outlineData, driverData, constructorData, frameData] = await Promise.all([
-        api.currentSession(),
-        api.currentOutline(),
-        api.driverStandings(),
-        api.constructorStandings(),
-        api.frame(),
-      ])
-      if (cancelled) return
+    const load = async (): Promise<boolean> => {
+      try {
+        const [sessionData, outlineData, driverData, constructorData, frameData] = await Promise.all([
+          api.currentSession(),
+          api.currentOutline(),
+          api.driverStandings(),
+          api.constructorStandings(),
+          api.frame(),
+        ])
+        if (cancelled) return true
 
-      if (isUnavailable(sessionData)) {
-        setError(`Session unavailable: ${sessionData.reason}`)
-      } else {
-        setSession(sessionData)
-      }
-
-      if (isUnavailable(outlineData)) {
-        // A live session builds its map from the cars' own positions, so an
-        // outline that is still filling in is expected, not an error.
-        if (outlineData.reason !== 'track_still_building') {
-          setError(`Circuit outline unavailable: ${outlineData.reason}`)
+        if (isUnavailable(sessionData)) {
+          setError(`Session unavailable: ${sessionData.reason}`)
+        } else {
+          setSession(sessionData)
+          // A failed attempt before the backend was up must not leave an
+          // error on a page that has now loaded.
+          setError(null)
         }
-      } else {
-        setOutline(outlineData)
-      }
 
-      if (!isUnavailable(driverData)) setDriverStandings(driverData)
-      if (!isUnavailable(constructorData)) setConstructorStandings(constructorData)
-      if (!isUnavailable(frameData)) setFrame(frameData)
+        if (isUnavailable(outlineData)) {
+          // A live session builds its map from the cars' own positions, so an
+          // outline that is still filling in is expected, not an error.
+          if (outlineData.reason !== 'track_still_building') {
+            setError(`Circuit outline unavailable: ${outlineData.reason}`)
+          }
+        } else {
+          setOutline(outlineData)
+        }
+
+        if (!isUnavailable(driverData)) setDriverStandings(driverData)
+        if (!isUnavailable(constructorData)) setConstructorStandings(constructorData)
+        if (!isUnavailable(frameData)) setFrame(frameData)
+        return true
+      } catch {
+        // The backend may still be starting; a page opened a second early
+        // must not sit on "connecting" for ever.
+        return false
+      }
     }
 
-    load()
+    const attempt = async () => {
+      const loaded = await load()
+      if (!loaded && !cancelled) timer = setTimeout(attempt, 3000)
+    }
+
+    attempt()
     return () => {
       cancelled = true
+      if (timer) clearTimeout(timer)
     }
   }, [])
 

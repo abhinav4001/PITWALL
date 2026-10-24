@@ -65,6 +65,8 @@ export function TrackMap({
               <feMergeNode in="SourceGraphic" />
             </feMerge>
           </filter>
+          {/* animateMotion follows an element by id, not by path data. */}
+          {carPath && <path id="pitwall-lap-path" d={carPath} />}
         </defs>
 
         {/* Track surface */}
@@ -145,7 +147,7 @@ export function TrackMap({
               rotate="auto"
               calcMode="linear"
             >
-              <mpath href={carPath} />
+              <mpath href="#pitwall-lap-path" />
             </animateMotion>
             <g transform="scale(0.85)">
               <F1CarBody colour={carColour} />
