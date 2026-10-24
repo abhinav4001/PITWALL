@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -208,6 +209,9 @@ class PitWallState:
         #: The next session due at this circuit, and when it was looked up.
         self._next_session_at: datetime | None = None
         self._next_session_checked: float = 0.0
+        #: Consecutive failed hub connections, and when to try again.
+        self._hub_failures = 0
+        self._hub_next_try = 0.0
         #: The live track, traced by the cars themselves (live mode only).
         self._live_trace: list[tuple[float, float]] = []
 
@@ -325,25 +329,51 @@ class PitWallState:
             return True
         return await self._connect_openf1_live()
 
+    def _hub_failed(self) -> None:
+        """Remember a failed connection and wait longer before the next try.
+
+        Measured on 2026-10-22: the hub answers 404 once its connection budget
+        is spent, and every further attempt spends it again.  The wait grows
+        to five minutes, which is the interval the hub itself uses.
+        """
+        self._hub_failures = min(self._hub_failures + 1, 5)
+        delay = min(300.0, 15.0 * 2 ** (self._hub_failures - 1))
+        self._hub_next_try = time.monotonic() + delay
+        logger.info(
+            "livetiming hub is not reachable: %s (trying again in %.0fs)",
+            self.livetiming.last_error if self.livetiming is not None else "unknown",
+            delay,
+        )
+
     async def _connect_livetiming(self) -> bool:
         """Try F1's own timing hub."""
         if self.livetiming is None:
             self.livetiming = LivetimingLiveAdapter()
-        try:
-            if not self.livetiming.source.connected:
-                await self.livetiming.source.connect()
-        except Exception as exc:  # noqa: BLE001 - never fail startup
-            logger.warning("livetiming connect failed: %s", exc)
+        source = self.livetiming.source
+        if not source.connected:
+            # The hub answers 404 while its connection budget is spent, and
+            # each attempt spends it further.  Back off like the socket does
+            # instead of asking once a minute for ever.
+            if time.monotonic() < self._hub_next_try:
+                return False
+            try:
+                await source.connect()
+            except Exception as exc:  # noqa: BLE001 - never fail startup
+                logger.warning("livetiming connect failed: %s", exc)
+                self._hub_failed()
+                return False
+
+        if not source.connected:
+            self._hub_failed()
             return False
 
-        if not self.livetiming.source.connected:
-            logger.info("livetiming hub is not reachable: %s", self.livetiming.last_error)
-            return False
+        self._hub_failures = 0
+        self._hub_next_try = 0.0
 
         # The hub stays connected whether or not a session is running, and it
         # keeps the last session in its snapshot afterwards, so the session it
         # reports is what decides whether we go live.
-        session = self.livetiming.source.state.session
+        session = source.state.session
         if not session_is_running(session):
             logger.info("livetiming hub is connected but no session is running")
             self.mode = "REPLAY"

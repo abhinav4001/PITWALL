@@ -477,8 +477,10 @@ export default function PitWallApp() {
 
                 <p className="text-zinc-400 light:text-zinc-600 font-mono text-sm mt-6 font-semibold max-w-md leading-relaxed">
                   Circuit of the Americas, Austin • {circuitFacts.year} •{' '}
-                  {frame?.total_laps ?? '—'} laps •{' '}
-                  {session?.mode === 'LIVE' ? 'live now' : 'the latest race'}
+                  {frame?.total_laps
+                    ? `${frame.total_laps} laps`
+                    : String(circuitFacts.name).toLowerCase()}{' '}
+                  • {session?.mode === 'LIVE' ? 'live now' : 'the latest race'}
                 </p>
 
                 <div className="flex flex-wrap items-center gap-4 mt-8">

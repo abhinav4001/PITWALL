@@ -60,7 +60,7 @@ export function RaceTicker({
             {lap ?? '—'}
           </span>
           <span className="text-sm font-bold text-zinc-500">
-            /{totalLaps ?? '—'} LAPS
+            {totalLaps ? `/${totalLaps} LAPS` : 'LAPS'}
           </span>
         </div>
 
