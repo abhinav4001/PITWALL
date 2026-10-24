@@ -235,8 +235,6 @@ export interface RadioReport {
   source?: string
   reason?: string
   count?: number
-  transcribed?: number
-  pending?: number
   detail?: string
   messages: RadioMessage[]
 }

@@ -838,3 +838,14 @@ minutes (a session has been seen and finished), or every **2 minutes** from
 five minutes before the calendar's next start until an hour after it.  The
 calendar comes from OpenF1 and is cached for ten minutes, so the free tier is
 barely touched.
+
+### 43. The radio is the recording, not a guess at it
+
+The offline transcript was removed after listening to it: on the 2024 United
+States Grand Prix it turned "the stewards are looking at a max" into "the
+satires of read about of the socket", and whole calls came out as "the".
+The panel now plays F1's own MP3s from the static archive, one shared
+`<audio>` element with `preload="none"`, a real duration and a real
+progress bar.  Live calls carry the hub's `Path`; replayed calls carry the
+`recording_url` cached with the pack.  The archive answers `audio/mpeg`
+with range requests and no authentication, so nothing has to be proxied.

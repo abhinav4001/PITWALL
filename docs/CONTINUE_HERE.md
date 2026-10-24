@@ -91,11 +91,11 @@ replay-compatible surface the OpenF1 adapter presents).
 | "why can't we use the new api for the realtime details" | **Answered and fixed** | LiveF1's URL was stale, not paywalled. The open endpoint is `/signalrcore`. |
 | "the strategy should be a guess: if the driver I am watching pits this time he will be behind or ahead of this guy" | **Done** | The card now leads with the call and then **"P1 — where you end up — ahead of VER"**, worked out from the real gaps. |
 | "what is that time tbh, i think it is unnecessary" | **Removed** | The race time, the p10-p90 band and the fastest/slowest case are gone from the card. |
-| "the radio … should be given at the moment it comes in rather than all at once with the timestamp" | **Done** | Only the calls made by now are served, newest first. 81 shown, 81 transcribed. |
+| "the radio … should be given at the moment it comes in rather than all at once with the timestamp" | **Done** | Only the calls made by now are served, newest first, each one playable. |
 | "the ai asking stuff at the bottom i think we can scrap it for now" | **Removed** | The conversational assistant panel and its state are gone. |
 | "make every boxes etc position better for viewing" | **Done** | The live view was reorganised: the map and tower on the left, strategy, tyre, weather and radio down the right, with the chat box's space given to them. |
-| "the transcribing feature is not working" | **It was, and now it is faster** | 147 transcripts are cached; the task runs **newest first** so the calls on screen are ready first. |
-| "in real race weekend will the radio be audio or transcript" | **Both, and better** | Live: F1's own hub sends the radio **as text**, so it appears as it is said. Replay: the MP3 plays and the transcript is produced offline. |
+| "can we change the radio to audio cause the transcribed one is just shit" | **Audio only** | The panel plays F1's official recordings; the machine transcript never matched what was said, so it is gone. |
+| "in real race weekend will the radio be audio or transcript" | **Audio, in both modes** | Live: the hub sends the MP3 path with each call, so it plays as it happens. Replay: the MP3s cached with the session pack play the same way. |
 | "tyre degradation option … keeps fluctuating between soft and medium" | **Fixed** | It was echoing whichever compound the driver was on. Now only the compound they are on is projected, and the unreliable offsets no longer tilt the ranking. |
 | "remove all the simulation things like the 1x things" | **Removed** | The speed control, the pause button and the "REPLAY" badges are gone. The pit wall plays at real-time speed. |
 | "like this text please remove from everywhere" | **Removed** | "Session 9617 • REPLAY • Lap 19/56 • Real OpenF1 telemetry", "AUSTIN 2024 • REPLAY • SESSION 9617" and "154 readings \| rain risk 0%" are all gone. |
@@ -148,20 +148,23 @@ rather than inventing one.
 
 ```
 /api/team_radio (OpenF1)  ->  recording_url (F1's public archive, no auth)
-                          ->  MP3 fetched
-                          ->  vosk transcribes it locally
-                          ->  radio.json, served by /api/radio
+                          ->  cached with the session pack (radio_raw.json)
+                          ->  /api/radio  ->  the browser plays the MP3
+
+live hub TeamRadio        ->  Captions + Path (the same archive)
+                          ->  /api/radio  ->  the browser plays the MP3
 ```
 
-* The model is `vosk-model-en-us-0.22-lgraph` (128 MB), chosen after
-  comparing it with the small model on the same clips: the large one heard
-  "the stewards are looking at a **max**" where the small one heard
-  "a **bucks**". Override with `PITWALL_RADIO_MODEL`.
-* The transcription runs **in the background** and the panel fills in as
-  the results arrive; `/api/radio` reports `transcribed` and `pending`.
-* `faster-whisper` **cannot** work on this machine: `onnxruntime`'s DLL is
-  refused by the Windows Application Control policy. `vosk` is pure C++ and
-  works.
+* There is **no speech recognition**. The transcript was removed on
+  24 October 2026: the machine's words were frequently wrong, and the
+  recording is the real thing.
+* The panel is audio-first: every call is a play button, the driver, the
+  team and the UTC time. A single shared `<audio>` element means one clip
+  plays at a time; the progress bar and duration come from the file itself.
+* `preload="none"` keeps a 30-call session from downloading 30 MP3s before
+  anyone presses play.
+* The audio archive answers `audio/mpeg` with range requests and no
+  authentication, so no proxy is needed.
 
 ---
 
@@ -186,7 +189,7 @@ python scripts/build_track_outlines.py --auto
 ## 7. Current verification state
 
 ```
-python -m pytest -q      -> 90 passed
+python -m pytest -q      -> 127 passed
 python -m ruff check .   -> All checks passed!
 cd web && npm run build  -> built
 ```
@@ -201,7 +204,7 @@ tyre     "MEDIUM | age 12 L | Degradation +0.32s | 44 laps of stint left |
           no cliff in the fitted range"
 strategy "HOLD | Stay on Mediums | Best window: lap 25-36 |
           P1 WHERE YOU END UP | ahead of VER"
-radio    "81 calls shown, 81 transcribed, none pending"
+radio    "30 calls, newest first, each one playable (no transcripts)"
 live     { "hub_connected": true, "hub_subscribed": true,
            "session": null, "frames_received": 10, "bad_frames": 0 }
 ```

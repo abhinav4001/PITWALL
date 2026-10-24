@@ -30,10 +30,7 @@ from pydantic import BaseModel
 from pitwall.data.openf1 import OpenF1Client
 from pitwall.data.radio import (
     RadioMessage,
-    load_cached_radio,
     radio_message_from_row,
-    save_radio,
-    transcribe_all,
 )
 from pitwall.data.session_pack import DEFAULT_DIR, SessionPack, download_session
 from pitwall.data.track import (
@@ -201,8 +198,6 @@ class PitWallState:
         self.live_session: dict[str, Any] | None = None
         #: F1's own live timing hub.  Free and unauthenticated.
         self.livetiming: LivetimingLiveAdapter | None = None
-        #: The background task that transcribes the radio calls.
-        self._radio_task: asyncio.Task[None] | None = None
         self._bundle: Any = None
         #: Watcher ticks with an open, silent hub subscription.
         self._silent_checks = 0
@@ -538,39 +533,6 @@ class PitWallState:
         logger.info("following live session %s at %s", session["session_key"], self.circuit)
         return True
 
-    async def _transcribe_radio(self, session_key: int) -> None:
-        """Transcribe the session's radio calls in the background.
-
-        The calls are audio; the transcript is produced on this machine with
-        an offline speech recogniser.  It takes a while - roughly ten seconds
-        a call with the good model - so it runs in the background and the
-        panel fills in as the results arrive.
-        """
-        directory = SESSION_DIR / str(session_key)
-        messages = _raw_radio(directory)
-        if not messages:
-            return
-        pending = [message for message in messages if not message.text]
-        if not pending:
-            return
-        logger.info("transcribing %d radio calls for session %s", len(pending), session_key)
-
-        async def publish(done: list[RadioMessage]) -> None:
-            # The transcription runs newest first, so the file is put back in
-            # the order the calls were made.
-            save_radio(directory, sorted(done, key=lambda m: str(m.date or "")))
-
-        try:
-            # Newest first: the calls that have just been made are the ones
-            # on screen, so they are the ones worth having ready.
-            await transcribe_all(
-                list(reversed(messages)),
-                work_dir=directory,
-                on_done=publish,
-            )
-        except Exception as exc:  # noqa: BLE001 - the radio is optional
-            logger.warning("radio transcription failed: %s", exc)
-
     async def shutdown(self) -> None:
         if self.loop is not None:
             await self.loop.stop()
@@ -751,11 +713,6 @@ class PitWallState:
             )
         self._bundle = bundle
         await self._replace_loop(self.replayer)
-
-        # The radio transcripts are produced in the background: the panel
-        # fills in as they arrive rather than after the whole session.
-        if self._radio_task is None or self._radio_task.done():
-            self._radio_task = asyncio.create_task(self._transcribe_radio(session_key))
         return True
 
     def frame_payload(self) -> dict[str, Any]:
@@ -1349,11 +1306,11 @@ async def weather() -> dict[str, Any]:
 
 @app.get("/api/radio")
 async def radio(limit: int = 30) -> dict[str, Any]:
-    """Team radio: the calls, their audio, and their transcript.
+    """Team radio: the calls and their audio.
 
-    The calls come from OpenF1's ``/team_radio`` feed.  Each one is an MP3 on
-    F1's public static archive, and the transcript is produced on this
-    machine with an offline speech recogniser - nothing is sent anywhere.
+    Every call is an MP3 on F1's public static archive and is played straight
+    from the browser.  A live call carries the path the hub sent with it; a
+    replayed call carries the URL OpenF1 published when the pack was cached.
 
     The feed is deliberately **not** fetched while a request is waiting: the
     calls are fetched once, when the session is prepared, and served from the
@@ -1363,9 +1320,6 @@ async def radio(limit: int = 30) -> dict[str, Any]:
         return _unavailable("no_replay_session_cached")
 
     if state.mode == "LIVE":
-        # The hub sends its own captions with each call, so a live session
-        # needs no download and no transcription: the words arrive with the
-        # audio.
         rows = _optional(state.replayer, "recent_radio", limit) or []
         drivers = (
             state.livetiming.source.state.drivers if state.livetiming is not None else {}
@@ -1380,7 +1334,7 @@ async def radio(limit: int = 30) -> dict[str, Any]:
                     "driver_number": number,
                     "team": meta.get("team"),
                     "text": row.get("text"),
-                    "recording_url": None,
+                    "recording_url": row.get("recording_url"),
                     "duration": None,
                 }
             )
@@ -1389,28 +1343,10 @@ async def radio(limit: int = 30) -> dict[str, Any]:
             "source": "livetiming.team_radio" if calls else "unavailable",
             "reason": "" if calls else "no_radio_feed",
             "count": len(calls),
-            "transcribed": len(calls),
-            "pending": 0,
             "messages": calls,
         }
 
-    directory = SESSION_DIR / str(state.replayer.session_key)
-    messages = load_cached_radio(directory)
-    raw = _raw_radio(directory)
-
-    # The cached file carries the transcripts; the raw file carries every
-    # call.  Merge them so the panel shows the calls even while the
-    # transcripts are still being produced.
-    if raw:
-        by_key = {message.recording_url: message for message in messages}
-        merged: list[RadioMessage] = []
-        for message in raw:
-            cached = by_key.get(message.recording_url)
-            if cached is not None and cached.text:
-                message.text = cached.text
-            merged.append(message)
-        messages = merged
-
+    messages = _raw_radio(SESSION_DIR / str(state.replayer.session_key))
     if not messages:
         return {
             "available": False,
@@ -1425,38 +1361,32 @@ async def radio(limit: int = 30) -> dict[str, Any]:
             ),
         }
 
-    transcribed = sum(1 for message in messages if message.text)
-
     # The radio plays out with the race: only the calls that have already
     # happened by now are shown, so a call appears at the moment it is made
     # rather than the whole session appearing at once.
-    if state.replayer is not None:
-        clock = getattr(state.replayer, "clock", None)
-        position = getattr(clock, "position_ns", 0) if clock is not None else 0
-        if position:
-            upto = datetime.fromtimestamp(position / 1e9, tz=UTC)
-            in_play = []
-            for message in messages:
-                stamp = message.date
-                if not stamp:
-                    in_play.append(message)
-                    continue
-                try:
-                    when = datetime.fromisoformat(stamp)
-                except ValueError:
-                    in_play.append(message)
-                    continue
-                if when <= upto:
-                    in_play.append(message)
-            messages = in_play
+    clock = getattr(state.replayer, "clock", None)
+    position = getattr(clock, "position_ns", 0) if clock is not None else 0
+    if position:
+        upto = datetime.fromtimestamp(position / 1e9, tz=UTC)
+        in_play = []
+        for message in messages:
+            stamp = message.date
+            if not stamp:
+                in_play.append(message)
+                continue
+            try:
+                when = datetime.fromisoformat(stamp)
+            except ValueError:
+                in_play.append(message)
+                continue
+            if when <= upto:
+                in_play.append(message)
+        messages = in_play
 
-    transcribed = sum(1 for message in messages if message.text)
     return {
         "available": True,
         "source": "openf1.team_radio",
         "count": len(messages),
-        "transcribed": transcribed,
-        "pending": len(messages) - transcribed,
         "messages": [message.to_dict() for message in messages[-limit:]],
     }
 

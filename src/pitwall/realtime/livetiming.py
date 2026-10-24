@@ -62,6 +62,10 @@ HUB_BASE = "https://livetiming.formula1.com/signalrcore"
 #: The websocket address.  The token goes in the ``id`` query parameter.
 WS_BASE = "wss://livetiming.formula1.com/signalrcore"
 
+#: The archive the radio MP3s live on.  The JSON archive is gated, the audio
+#: is not, so a live call can be played from the browser with no proxy.
+STATIC_BASE = "https://livetiming.formula1.com/static"
+
 #: The record separator of the SignalR JSON protocol.
 SEPARATOR = "\x1e"
 
@@ -176,6 +180,24 @@ def _parse_utc(value: Any) -> datetime | None:
     except ValueError:
         return None
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def _radio_url(path: Any) -> str | None:
+    """The playable address of a radio clip.
+
+    The hub sends a path relative to its static archive (for example
+    ``2026/.../TeamRadio/VER01_1_...mp3``); the browser can play that
+    directly.  A path that is already absolute is left alone.
+    """
+    if not isinstance(path, str) or not path.strip():
+        return None
+    path = path.strip()
+    if path.startswith(("http://", "https://")):
+        return path
+    path = path.lstrip("/")
+    if path.startswith("static/"):
+        path = path[len("static/") :]
+    return f"{STATIC_BASE}/{path}"
 
 
 #: Session statuses that mean the session is no longer running.
@@ -793,13 +815,13 @@ class LivetimingLiveSource:
         del self.state.weather[:-600]
 
     def _on_TeamRadio(self, payload: dict[str, Any]) -> None:
-        """F1 sends the radio **as text** - no transcription needed.
+        """F1 sends each radio call with its words and the clip's path.
 
         The caption is normally ``{"Utc": ..., "Captions": "1: ..."}`` under a
         ``"<driver>-<utc>"`` key, but the recording's metadata has also been
         seen as a JSON string inside the caption.  Both are accepted: the
-        words are what matter, and a call that cannot be attributed is still
-        shown rather than dropped.
+        words and the MP3 path are what matter, and a call that cannot be
+        attributed is still shown rather than dropped.
         """
         captions = payload.get("Captions")
         if isinstance(captions, list):
@@ -808,7 +830,10 @@ class LivetimingLiveSource:
             items = captions
         else:
             return
-        known = {(str(r.get("date") or ""), str(r.get("text") or "")) for r in self.state.radio}
+        known: dict[tuple[str, str], dict[str, Any]] = {
+            (str(r.get("date") or ""), str(r.get("text") or "")): r
+            for r in self.state.radio
+        }
         for key, row in items.items():
             if isinstance(row, str):
                 # Either the words themselves or the recording metadata.
@@ -844,17 +869,23 @@ class LivetimingLiveSource:
             stamp = str(row.get("Utc") or key)
             who, _, spoken = text.partition(": ")
             spoken = spoken or text
-            if (stamp, spoken) in known:
+            recording_url = _radio_url(row.get("Path"))
+            seen = known.get((stamp, spoken))
+            if seen is not None:
+                # A later snapshot may carry the audio path the first one
+                # lacked; keep the call and fill the path in.
+                if not seen.get("recording_url") and recording_url:
+                    seen["recording_url"] = recording_url
                 continue
-            known.add((stamp, spoken))
-            self.state.radio.append(
-                {
-                    "date": stamp,
-                    "driver_number": driver_number,
-                    "who": who if spoken != text else None,
-                    "text": spoken,
-                }
-            )
+            entry = {
+                "date": stamp,
+                "driver_number": driver_number,
+                "who": who if spoken != text else None,
+                "text": spoken,
+                "recording_url": recording_url,
+            }
+            known[(stamp, spoken)] = entry
+            self.state.radio.append(entry)
         self.state.radio.sort(key=lambda r: str(r.get("date") or ""))
         del self.state.radio[:-400]
 

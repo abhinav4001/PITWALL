@@ -269,7 +269,7 @@ def test_a_car_in_the_pits_is_marked_off_track() -> None:
 
 
 def test_team_radio_comes_through_as_text() -> None:
-    """F1's own captions are on the topic, so no transcription is needed."""
+    """F1's own caption and audio path are on the topic."""
     source = LivetimingLiveSource()
     source._handle(
         _frame(
@@ -289,13 +289,47 @@ def test_team_radio_comes_through_as_text() -> None:
     assert radio[0]["driver_number"] == 1
     assert radio[0]["text"] == "the rear is moving around a lot"
     assert radio[0]["who"] == "VERSTAPPEN"
+    assert radio[0]["recording_url"] is None
+
+
+def test_a_later_snapshot_can_add_the_audio_path() -> None:
+    """A call first seen without audio must not lose the path that follows."""
+    source = LivetimingLiveSource()
+    first = {
+        "Captions": {
+            "1-2026-10-24T15:05:00": {
+                "Utc": "2026-10-24T15:05:00Z",
+                "Captions": "VERSTAPPEN: box box",
+            }
+        }
+    }
+    second = {
+        "Captions": {
+            "1-2026-10-24T15:05:00": {
+                "Utc": "2026-10-24T15:05:00Z",
+                "Captions": "VERSTAPPEN: box box",
+                "Path": "2026/2026-10-25_United_States_Grand_Prix/"
+                "2026-10-23_Practice_3/TeamRadio/VER01_1_x.mp3",
+            }
+        }
+    }
+    source._handle(_frame("TeamRadio", first))
+    source._handle(_frame("TeamRadio", second))
+    radio = source.state.radio
+    assert len(radio) == 1
+    assert radio[0]["recording_url"] == (
+        "https://livetiming.formula1.com/static/2026/"
+        "2026-10-25_United_States_Grand_Prix/"
+        "2026-10-23_Practice_3/TeamRadio/VER01_1_x.mp3"
+    )
 
 
 def test_a_radio_caption_wrapped_in_metadata_is_still_shown() -> None:
-    """The same call must not be shown twice, and must not be dropped.
+    """The same call must not be shown twice, and its audio path is kept.
 
     The hub repeats the caption in later snapshots, and some builds wrap the
-    recording metadata in a JSON string.  The words still have to appear once.
+    recording metadata in a JSON string.  The words and the MP3 path still
+    have to appear once.
     """
     source = LivetimingLiveSource()
     payload = {
@@ -313,6 +347,10 @@ def test_a_radio_caption_wrapped_in_metadata_is_still_shown() -> None:
     assert len(radio) == 1
     assert radio[0]["driver_number"] == 16
     assert radio[0]["text"] == "I have no grip at all"
+    assert (
+        radio[0]["recording_url"]
+        == "https://livetiming.formula1.com/static/TeamRadio/x.mp3"
+    )
 
 
 def test_timing_data_gives_the_gap_and_the_order() -> None:
