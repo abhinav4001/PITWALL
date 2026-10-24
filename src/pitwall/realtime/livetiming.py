@@ -138,6 +138,36 @@ def _number(value: Any) -> float | None:
         return None
 
 
+def _int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _seconds(value: Any) -> float | None:
+    """A lap time or gap as seconds.
+
+    The hub writes times as ``"1:39.699"`` and gaps as ``"+1.234"``, while the
+    replay's pack stores plain seconds.  Both arrive at the same widgets, so
+    both are normalised here rather than at the point of display.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if ":" in text:
+            minutes, _, rest = text.partition(":")
+            return float(minutes) * 60.0 + float(rest)
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_utc(value: Any) -> datetime | None:
     if not value:
         return None
@@ -666,22 +696,28 @@ class LivetimingLiveSource:
             entry.update(
                 {
                     "driver_number": number,
-                    "number_of_laps": row.get("NumberOfLaps", entry.get("number_of_laps")),
-                    "position": row.get("Position", entry.get("position")),
+                    "number_of_laps": _int(
+                        row.get("NumberOfLaps", entry.get("number_of_laps"))
+                    ),
+                    "position": _int(row.get("Position", entry.get("position"))),
                     "retired": row.get("Retired", entry.get("retired")),
                     "stopped": row.get("Stopped", entry.get("stopped")),
                     "status": row.get("Status", entry.get("status")),
-                    "last_lap": (row.get("LastLap") or {}).get(
-                        "Value", entry.get("last_lap")
+                    "last_lap": _seconds(
+                        (row.get("LastLap") or {}).get("Value", entry.get("last_lap"))
                     ),
-                    "best_lap": (row.get("BestLap") or {}).get(
-                        "Value", entry.get("best_lap")
+                    "best_lap": _seconds(
+                        (row.get("BestLap") or {}).get("Value", entry.get("best_lap"))
                     ),
-                    "interval_to_ahead": (row.get("IntervalToAhead") or {}).get(
-                        "Value", entry.get("interval_to_ahead")
+                    "interval_to_ahead": _seconds(
+                        (row.get("IntervalToAhead") or {}).get(
+                            "Value", entry.get("interval_to_ahead")
+                        )
                     ),
-                    "interval_to_leader": (row.get("IntervalToLeader") or {}).get(
-                        "Value", entry.get("interval_to_leader")
+                    "interval_to_leader": _seconds(
+                        (row.get("IntervalToLeader") or {}).get(
+                            "Value", entry.get("interval_to_leader")
+                        )
                     ),
                     "pit_stop": (row.get("PitStop") or {}).get(
                         "PitStop", entry.get("pit_stop")
@@ -725,7 +761,7 @@ class LivetimingLiveSource:
                 ("start_laps", "StartLaps"),
             ):
                 if latest.get(key_name) is not None:
-                    entry[field_name] = latest[key_name]
+                    entry[field_name] = _int(latest[key_name])
             entry["new"] = latest.get("New")
 
     def _on_WeatherData(self, payload: dict[str, Any]) -> None:
@@ -1072,6 +1108,7 @@ class LivetimingLiveAdapter:
             timing = state.timing.get(number, {})
             tyre = state.tyres.get(number, {})
             tyres_total = tyre.get("total_laps")
+            position = _int(state.order.get(number) or timing.get("position"))
             drivers.append(
                 DriverFrame(
                     driver_number=number,
@@ -1079,7 +1116,7 @@ class LivetimingLiveAdapter:
                     name=str(meta.get("name") or ""),
                     team=str(meta.get("team") or ""),
                     team_colour=_colour(meta.get("team_colour")),
-                    position=state.order.get(number) or timing.get("position"),
+                    position=position,
                     x=car.get("x"),
                     y=car.get("y"),
                     z=car.get("z"),

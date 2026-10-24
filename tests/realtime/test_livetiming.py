@@ -342,6 +342,47 @@ def test_timing_data_gives_the_gap_and_the_order() -> None:
     assert source.state.order[44] == 2
 
 
+def test_the_hubs_string_times_are_normalised() -> None:
+    """The hub writes ``"1:39.699"``; the widgets expect seconds.
+
+    Left as strings, the tower would print a lap time of ``NaN`` and a mixed
+    string/number position would make the sort raise - one broken tick, and
+    the live page would freeze.
+    """
+    source = LivetimingLiveSource()
+    source._handle(
+        _frame(
+            "TimingData",
+            {
+                "Lines": {
+                    "44": {
+                        "Position": "3",
+                        "NumberOfLaps": "12",
+                        "LastLap": {"Value": "1:39.699"},
+                        "IntervalToAhead": {"Value": "+1.234"},
+                        "IntervalToLeader": {"Value": "+4.567"},
+                    },
+                    "16": {
+                        "Position": "4",
+                        "NumberOfLaps": "11",
+                        "LastLap": {"Value": "1:40.001"},
+                    },
+                }
+            },
+        )
+    )
+    assert source.state.timing[44]["last_lap"] == 99.699
+    assert source.state.timing[44]["interval_to_ahead"] == 1.234
+    assert source.state.timing[44]["interval_to_leader"] == 4.567
+    assert source.state.timing[44]["position"] == 3
+    assert source.state.timing[44]["number_of_laps"] == 12
+    assert source.state.order[44] == 3
+
+    frame = LivetimingLiveAdapter(source).frame()
+    assert [driver.position for driver in frame.drivers] == [3, 4]
+    assert frame.drivers[0].last_lap_s == 99.699
+
+
 def test_the_tyres_come_from_timing_app_data() -> None:
     """``TimingData`` has no compound; ``TimingAppData`` does."""
     source = LivetimingLiveSource()
