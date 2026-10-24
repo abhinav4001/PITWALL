@@ -319,6 +319,7 @@ export const api = {
     getJson<CircuitOutline>(
       `/api/circuits/${encodeURIComponent(circuit)}/outline${year ? `?year=${year}` : ''}`,
     ),
+  currentOutline: () => getJson<CircuitOutline>('/api/outline/current'),
   frame: (at?: number) =>
     getJson<RaceFrame>(`/api/positions${at !== undefined ? `?at=${at}` : ''}`),
   timing: (at?: number) => getJson<RaceFrame>(`/api/timing${at !== undefined ? `?at=${at}` : ''}`),

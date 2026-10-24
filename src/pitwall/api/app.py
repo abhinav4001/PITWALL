@@ -18,7 +18,7 @@ import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +53,11 @@ from pitwall.realtime.live import (
     find_live_session,
     latest_per_driver,
 )
-from pitwall.realtime.livetiming import LivetimingLiveAdapter
+from pitwall.realtime.livetiming import (
+    LivetimingLiveAdapter,
+    _parse_utc,
+    session_is_running,
+)
 from pitwall.realtime.session_replay import (
     SessionReplayer,
     project_frame,
@@ -104,6 +108,78 @@ def _unavailable(reason: str, **extra: Any) -> dict[str, Any]:
     return {"available": False, "reason": reason, "source": "unavailable", **extra}
 
 
+def _optional(source: Any, name: str, *args: Any) -> Any:
+    """Call a helper the source may not have.
+
+    The live adapter deliberately lacks the replay-only helpers, so every
+    lookup of one goes through here instead of assuming they all exist.
+    """
+    method = getattr(source, name, None)
+    if method is None:
+        return None
+    try:
+        return method(*args)
+    except Exception:  # noqa: BLE001 - an optional helper must not 500
+        return None
+
+
+def _recent_messages(limit: int = 12) -> list[dict[str, Any]]:
+    """Race-control messages from whichever source is running."""
+    if state.replayer is None:
+        return []
+    method = getattr(state.replayer, "recent_messages", None)
+    if method is None:
+        return []
+    clock = getattr(state.replayer, "clock", None)
+    try:
+        if clock is not None:
+            return method(clock.position_ns, limit=limit)
+        return method(limit=limit)
+    except Exception:  # noqa: BLE001 - messages are a nicety
+        return []
+
+
+def _weather_summary() -> dict[str, Any]:
+    """The weather for whichever source is running.
+
+    The replay has a summary of its own; a live session is summarised from
+    the hub's own weather reports, in the same shape, so the card does not
+    change between the two.
+    """
+    if state.replayer is None:
+        return _unavailable("no_replay_session_cached")
+    summary = _optional(state.replayer, "weather_summary")
+    if isinstance(summary, dict):
+        return summary
+    readings = _optional(state.replayer, "weather") or []
+    if not readings:
+        return _unavailable(
+            "no_weather_feed",
+            reason_detail="The live timing feed has published no weather yet.",
+        )
+    latest = readings[-1]
+    raining = bool(latest.get("rainfall"))
+    return {
+        "available": True,
+        "source": "livetiming.weather",
+        "rain_risk_percent": None,
+        "condition": "wet" if raining else "clear",
+        "clear_reports": 0,
+        "slippery_reports": 0,
+        "readings": readings,
+        "current": {
+            "date": latest.get("date"),
+            "air_temperature": latest.get("air_temperature"),
+            "track_temperature": latest.get("track_temperature"),
+            "humidity": latest.get("humidity"),
+            "pressure": latest.get("pressure"),
+            "wind_speed": latest.get("wind_speed"),
+            "wind_direction": latest.get("wind_direction"),
+            "rainfall": latest.get("rainfall"),
+        },
+    }
+
+
 # ----------------------------------------------------------------------
 # shared state
 # ----------------------------------------------------------------------
@@ -127,12 +203,36 @@ class PitWallState:
         #: The background task that transcribes the radio calls.
         self._radio_task: asyncio.Task[None] | None = None
         self._bundle: Any = None
+        #: Watcher ticks with an open, silent hub subscription.
+        self._silent_checks = 0
+        #: The next session due at this circuit, and when it was looked up.
+        self._next_session_at: datetime | None = None
+        self._next_session_checked: float = 0.0
+        #: The live track, traced by the cars themselves (live mode only).
+        self._live_trace: list[tuple[float, float]] = []
 
     async def startup(self) -> None:
         self.client = OpenF1Client(min_interval=1.0)
         await self._load_replay(DEFAULT_REPLAY_SESSION)
         await self._check_for_live_session()
         asyncio.create_task(self._follow_latest_session())
+        asyncio.create_task(self._live_geometry_loop())
+
+    async def _live_geometry_loop(self) -> None:
+        """Keep the live map in step with the positions the cars are sending.
+
+        The outline is built from the cars' own path, so it has to be
+        refreshed as they circulate - otherwise the map would still be
+        showing the replay's circuit when the session starts.
+        """
+        while True:
+            await asyncio.sleep(5)
+            if self.mode != "LIVE":
+                continue
+            try:
+                self._rebuild_live_geometry()
+            except Exception as exc:  # noqa: BLE001 - the map must not crash
+                logger.debug("live geometry refresh failed: %s", exc)
 
     async def _follow_latest_session(self) -> None:
         """Keep the replay on the most recent session of this circuit.
@@ -240,10 +340,11 @@ class PitWallState:
             logger.info("livetiming hub is not reachable: %s", self.livetiming.last_error)
             return False
 
-        # The hub stays connected whether or not a session is running, so the
-        # session it reports is what decides whether we go live.
+        # The hub stays connected whether or not a session is running, and it
+        # keeps the last session in its snapshot afterwards, so the session it
+        # reports is what decides whether we go live.
         session = self.livetiming.source.state.session
-        if not session or not session.get("Key"):
+        if not session_is_running(session):
             logger.info("livetiming hub is connected but no session is running")
             self.mode = "REPLAY"
             return False
@@ -257,18 +358,99 @@ class PitWallState:
         self.replayer = self.livetiming  # type: ignore[assignment]
         self.circuit = self.livetiming.circuit
         self.year = self.livetiming.year
-        outline = load_outline(OUTLINE_DIR, self.circuit, self.year)
-        if outline is not None:
-            self.outline = outline.to_dict()
-            self.projection = TrackProjection.from_outline(outline.points)
-        self.loop = TickLoop(self.livetiming, self.projection, self._bundle)  # type: ignore[arg-type]
-        self.loop.speed = self.replay_speed
+        self._bundle = self._bundle_for(self.circuit, self.year)
+        self._rebuild_live_geometry()
+        # Rebuild the tick loop so it drives the live source, carrying the
+        # open browsers across - otherwise the page keeps receiving the
+        # replay's frames and never shows the session that is running.
+        await self._replace_loop(self.livetiming)
         logger.info(
-            "following the live session %s at %s on F1's timing hub",
+            "following the live session %s (%s) at %s on F1's timing hub",
             session.get("Key"),
+            session.get("Name"),
             self.circuit,
         )
         return True
+
+    def _bundle_for(self, circuit: str, year: int) -> Any:
+        """The calibration for a circuit and season, if one has been fitted.
+
+        Strategy numbers are only shown when a measured bundle exists for the
+        session being followed; a different season gets no invented forecast.
+        """
+        try:
+            return load_calibration(circuit, year)
+        except FileNotFoundError:
+            logger.info(
+                "no calibration for %s %s: the strategy card stays unavailable",
+                circuit,
+                year,
+            )
+            return None
+
+    async def _replace_loop(self, source: Any) -> None:
+        """Point the tick loop at a new source, keeping browsers attached.
+
+        The browser subscribes to one loop, so swapping the source without
+        moving the subscribers across would leave the page showing the old
+        feed for ever - which is exactly how the 2024 replay stayed on screen
+        through a live practice session.
+        """
+        old = self.loop
+        was_running = old is not None and old.is_running
+        new = TickLoop(source, self.projection, self._bundle)
+        new.speed = self.replay_speed
+        if old is not None:
+            new.take_clients_from(old)
+        self.loop = new
+        if old is not None:
+            await old.stop()
+        if was_running:
+            new.start()
+
+    def _rebuild_live_geometry(self) -> None:
+        """Point the map at the live positions.
+
+        F1's live feed reports X/Y in **its own** two-dimensional frame, not
+        in GPS coordinates, so the replay's GPS outline cannot be reused -
+        the cars would be drawn in the wrong place.  The outline is therefore
+        the path the cars have actually driven this session, which is a real
+        lap traced by a real car with nothing invented.  It fills in as the
+        session runs.
+        """
+        if self.livetiming is None:
+            return
+        source = self.livetiming.source
+        bounds = source.bounds()
+        trace = source.trace()
+        if bounds is None or len(trace) < 10:
+            self._live_trace = []
+            return
+        self._live_trace = trace
+        min_x, max_x, min_y, max_y = bounds
+        pad_x = max((max_x - min_x) * 0.03, 1.0)
+        pad_y = max((max_y - min_y) * 0.03, 1.0)
+        lo_x, hi_x = min_x - pad_x, max_x + pad_x
+        lo_y, hi_y = min_y - pad_y, max_y + pad_y
+
+        # Keep the map still unless the cars have driven outside it: re-scaling
+        # on every tick would make the whole circuit drift under the dots.
+        current = self.projection
+        if (
+            current is not None
+            and current.min_x <= lo_x
+            and current.max_x >= hi_x
+            and current.min_y <= lo_y
+            and current.max_y >= hi_y
+        ):
+            return
+        self.projection = TrackProjection(
+            min_x=lo_x, max_x=hi_x, min_y=lo_y, max_y=hi_y
+        )
+        # The tick loop holds its own reference, and it is the one that draws
+        # the cars, so it is pointed at the new projection too.
+        if self.loop is not None:
+            self.loop.projection = self.projection
 
     async def _connect_openf1_live(self) -> bool:
         """Fall back to OpenF1's live tier."""
@@ -298,13 +480,13 @@ class PitWallState:
         self.replayer = adapter  # type: ignore[assignment]
         self.circuit = adapter.circuit
         self.year = adapter.year
+        self._bundle = self._bundle_for(self.circuit, self.year)
         outline = load_outline(OUTLINE_DIR, self.circuit, self.year)
         if outline is not None:
             self.outline = outline.to_dict()
             self.projection = TrackProjection.from_outline(outline.points)
         # Rebuild the tick loop so it drives the live source.
-        self.loop = TickLoop(adapter, self.projection, self._bundle)  # type: ignore[arg-type]
-        self.loop.speed = self.replay_speed
+        await self._replace_loop(adapter)
         logger.info("following live session %s at %s", session["session_key"], self.circuit)
         return True
 
@@ -361,12 +543,125 @@ class PitWallState:
         """
         while True:
             await asyncio.sleep(interval)
-            if self.mode == "LIVE":
-                continue
             try:
+                if self.mode == "LIVE":
+                    # The live track fills in as the cars circulate, so the
+                    # map is refreshed while the session runs.
+                    if self._session_has_ended():
+                        logger.info("the live session has ended; back to the replay")
+                        await self._back_to_replay()
+                    else:
+                        self._rebuild_live_geometry()
+                    continue
                 await self._check_for_live_session()
+                await self._refresh_a_silent_hub()
             except Exception as exc:  # noqa: BLE001 - the watcher must survive
                 logger.warning("live session check failed: %s", exc)
+
+    async def _refresh_a_silent_hub(self) -> None:
+        """Reopen a subscription the hub may never push a new session to.
+
+        Three cases need this:
+
+        * a subscription opened before any session has started, which has
+          received nothing at all - reopened every half hour;
+        * a subscription made during one session, now looking at a finished
+          one - reopened every twenty minutes;
+        * a session that is scheduled to be running right now - reopened
+          every two minutes, so the start is not missed by twenty.
+
+        All three rates are ones the hub's connection budget is comfortable
+        with.
+        """
+        if self.livetiming is None:
+            return
+        source = self.livetiming.source
+        now = datetime.now(UTC)
+        start = await self._next_session_start()
+        imminent = (
+            start is not None
+            and start - timedelta(minutes=5) <= now <= start + timedelta(minutes=60)
+        )
+        if imminent:
+            limit = 2
+        elif source.state.frames_received:
+            limit = 20
+        else:
+            limit = 30
+        self._silent_checks += 1
+        if self._silent_checks < limit:
+            return
+        self._silent_checks = 0
+        logger.info("livetiming: reopening the subscription to look for a session")
+        # Dropping the source makes the next check negotiate a fresh socket
+        # and subscribe again from scratch.
+        await source.aclose()
+        self.livetiming = None
+
+    async def _next_session_start(self) -> datetime | None:
+        """When the next session at this circuit is due to start.
+
+        Used only to decide how often to reopen the hub subscription while no
+        session is running.  The calendar is cached, so the free API tier is
+        barely touched.
+        """
+        now = datetime.now(UTC)
+        if self._next_session_at is not None and (
+            now - self._next_session_at < timedelta(minutes=60)
+        ):
+            return self._next_session_at
+        if self.client is None:
+            return None
+        if now.timestamp() - self._next_session_checked < 600:
+            return self._next_session_at
+        self._next_session_checked = now.timestamp()
+        try:
+            sessions = await self.client.get_sessions(
+                circuit_short_name=self.circuit
+            )
+        except Exception as exc:  # noqa: BLE001 - the calendar is a nicety
+            logger.debug("session calendar lookup failed: %s", exc)
+            return self._next_session_at
+        upcoming = []
+        for session in sessions:
+            when = _parse_utc(session.get("date_start"))
+            if when is None or session.get("is_cancelled"):
+                continue
+            if when >= now - timedelta(minutes=60):
+                upcoming.append(when)
+        self._next_session_at = min(upcoming) if upcoming else None
+        return self._next_session_at
+
+    def _session_has_ended(self) -> bool:
+        """Whether the hub has stopped reporting a running session."""
+        if self.livetiming is None:
+            return True
+        state = self.livetiming.source.state
+        if not session_is_running(state.session):
+            return True
+        last = state.last_frame_at
+        if last is not None:
+            try:
+                return (datetime.now(UTC) - last).total_seconds() > 600
+            except (TypeError, ValueError):
+                return False
+        return False
+
+    async def _back_to_replay(self) -> None:
+        """Drop the live feed and follow the replay again.
+
+        The tick loop is left in place: loading the replay swaps the source
+        and moves the connected browsers across, so nothing goes dark.
+        """
+        if self.livetiming is not None:
+            await self.livetiming.source.aclose()
+            self.livetiming = None
+        self.mode = "REPLAY"
+        self.live_session = None
+        self._live_trace = []
+        if not await self._load_replay(DEFAULT_REPLAY_SESSION) and self.loop is not None:
+            await self.loop.stop()
+            self.loop = None
 
     async def _load_replay(self, session_key: int) -> bool:
         if not SessionPack.exists(session_key, SESSION_DIR):
@@ -407,8 +702,7 @@ class PitWallState:
                 self.year,
             )
         self._bundle = bundle
-        self.loop = TickLoop(self.replayer, self.projection, bundle)
-        self.loop.speed = self.replay_speed
+        await self._replace_loop(self.replayer)
 
         # The radio transcripts are produced in the background: the panel
         # fills in as they arrive rather than after the whole session.
@@ -463,7 +757,11 @@ async def current_session() -> dict[str, Any]:
     """
     payload: dict[str, Any] = {
         "available": state.replayer is not None,
-        "source": "openf1.session_pack" if state.replayer else "unavailable",
+        "source": (
+            ("livetiming.hub" if state.mode == "LIVE" else "openf1.session_pack")
+            if state.replayer
+            else "unavailable"
+        ),
         "mode": state.mode,
     }
     if state.replayer is not None:
@@ -620,6 +918,84 @@ async def circuit_outline(circuit_name: str, year: int | None = None) -> dict[st
     }
 
 
+@app.get("/api/outline/current")
+async def current_outline() -> dict[str, Any]:
+    """The map for whatever is being shown: the replay, or the live session.
+
+    A live session has no GPS outline - F1's live feed reports positions in
+    its own coordinate frame - so the live outline is the path the cars have
+    driven, and it fills in as they circulate.
+    """
+    projection = state.projection
+    if projection is None:
+        return _unavailable("no_track_geometry")
+
+    if state.mode == "LIVE":
+        trace = state._live_trace  # noqa: SLF001 - same package
+        if len(trace) < 10:
+            return _unavailable(
+                "track_still_building",
+                mode=state.mode,
+                points=len(trace),
+                circuit=state.circuit,
+            )
+        return {
+            "available": True,
+            "source": "livetiming.positions",
+            "circuit": state.circuit,
+            "year": state.year,
+            "points": [
+                {"x": projection.project(x, y)[0], "y": projection.project(x, y)[1]}
+                for x, y in trace
+            ],
+            "raw_points": [{"x": x, "y": y} for x, y in trace],
+            "corners": [],
+            "start_finish": None,
+            "view_box": {"width": projection.view_width, "height": projection.view_height},
+            "projection": projection.as_dict(),
+            "metadata": {"point_count": len(trace)},
+        }
+
+    outline = state.outline
+    if not outline:
+        return _unavailable("outline_not_built", circuit=state.circuit, year=state.year)
+    return {
+        "available": True,
+        "source": outline.get("source"),
+        "circuit": outline.get("circuit", state.circuit),
+        "year": outline.get("year", state.year),
+        "points": [
+            {
+                "x": projection.project(float(p["x"]), float(p["y"]))[0],
+                "y": projection.project(float(p["x"]), float(p["y"]))[1],
+            }
+            for p in outline.get("points") or []
+        ],
+        "raw_points": outline.get("points") or [],
+        "corners": [
+            {
+                "number": c.get("number"),
+                "letter": c.get("letter", ""),
+                "x": projection.project(float(c["x"]), float(c["y"]))[0],
+                "y": projection.project(float(c["x"]), float(c["y"]))[1],
+            }
+            for c in outline.get("corners") or []
+        ],
+        "start_finish": (
+            {
+                "x": projection.project(*outline["start_finish"])[0],
+                "y": projection.project(*outline["start_finish"])[1],
+            }
+            if isinstance(outline.get("start_finish"), (list, tuple))
+            and len(outline["start_finish"]) == 2
+            else None
+        ),
+        "view_box": {"width": projection.view_width, "height": projection.view_height},
+        "projection": projection.as_dict(),
+        "metadata": outline.get("metadata") or {},
+    }
+
+
 @app.get("/api/championship/drivers")
 async def championship_drivers() -> list[dict[str, Any]]:
     """The 2026 drivers' championship with computed title odds."""
@@ -765,14 +1141,15 @@ async def replay_control(
                 state.replayer.seek(0.0)
         frame = state.replayer.frame(replay_speed=state.replay_speed)
         payload = project_frame(frame, state.projection) if state.projection else {}
+        clock = getattr(state.replayer, "clock", None)
     return {
         "available": True,
         "source": "openf1",
         "action": action,
         "speed": state.replay_speed,
-        "elapsed_s": round(frame.elapsed_s, 3),
-        "duration_s": round(state.replayer.clock.duration_s, 3),
-        "finished": state.replayer.finished,
+        "elapsed_s": round(float(getattr(clock, "elapsed_s", 0.0) or 0.0), 3),
+        "duration_s": round(float(getattr(clock, "duration_s", 0.0) or 0.0), 3),
+        "finished": bool(getattr(clock, "finished", False)),
         "drivers": payload.get("drivers", []),
     }
 
@@ -815,23 +1192,33 @@ async def strategies(
             return _unavailable("driver_not_in_session", driver_number=driver_number)
 
         rival = state.loop._rival_for(frame, driver)  # noqa: SLF001 - same package
-        elapsed = state.replayer.elapsed_race_time(driver_number, driver.lap or 1)
-        stint = state.replayer.stint_for(driver_number, driver.lap)
-        pace = state.replayer.driver_pace(driver_number, driver.lap)
+        # The live adapter does not carry the replay-only helpers (elapsed
+        # race time, stints, fitted pace), so they are looked up defensively
+        # rather than assumed - otherwise every session goes 500 in live mode.
+        elapsed = _optional(state.replayer, "elapsed_race_time", driver_number, driver.lap or 1)
+        stint = _optional(state.replayer, "stint_for", driver_number, driver.lap)
+        pace = _optional(state.replayer, "driver_pace", driver_number, driver.lap)
         rival_pace = (
-            state.replayer.driver_pace(rival.driver_number, rival.lap)
+            _optional(state.replayer, "driver_pace", rival.driver_number, rival.lap)
             if rival is not None
             else None
         )
+        clock = getattr(state.replayer, "clock", None)
+        try:
+            messages = (
+                state.replayer.recent_messages(clock.position_ns, limit=6)
+                if clock is not None
+                else state.replayer.recent_messages(limit=6)
+            )
+        except Exception:  # noqa: BLE001 - messages are a nicety
+            messages = []
         report = state.loop.engine.build_report(
             frame=frame,
             driver_number=driver_number,
-            elapsed_s=elapsed,
+            elapsed_s=elapsed or 0.0,
             stint=stint,
             rival=rival,
-            messages=state.replayer.recent_messages(
-                state.replayer.clock.position_ns, limit=6
-            ),
+            messages=messages,
             driver_pace=pace,
             rival_pace=rival_pace,
         )
@@ -856,10 +1243,12 @@ async def live_status() -> dict[str, Any]:
             "session": None,
         }
     session = hub.source.state.session
+    source_state = hub.source.state
     return {
         "available": True,
         "mode": state.mode,
         "hub_connected": hub.source.connected,
+        "hub_subscribed": hub.source.subscribed,
         "hub_error": hub.source.last_error,
         "session": {
             "session_key": session.get("Key"),
@@ -869,10 +1258,20 @@ async def live_status() -> dict[str, Any]:
         }
         if session
         else None,
-        "drivers": len(hub.source.state.cars),
-        "radio_calls": len(hub.source.state.radio),
-        "weather_reports": len(hub.source.state.weather),
-        "messages": len(hub.source.state.messages),
+        "drivers": len(source_state.cars),
+        "radio_calls": len(source_state.radio),
+        "weather_reports": len(source_state.weather),
+        "messages": len(source_state.messages),
+        # Diagnosis: which topics are actually arriving, so a silent feed is
+        # visible instead of looking like "no session is running".
+        "topics": dict(source_state.topics),
+        "frames_received": source_state.frames_received,
+        "bad_frames": source_state.bad_frames,
+        "last_frame_at": (
+            source_state.last_frame_at.isoformat()
+            if source_state.last_frame_at is not None
+            else None
+        ),
     }
 
 
@@ -888,7 +1287,7 @@ async def weather() -> dict[str, Any]:
     """
     if state.replayer is None:
         return _unavailable("no_replay_session_cached")
-    summary = state.replayer.weather_summary()
+    summary = _weather_summary()
     if not summary.get("available"):
         return _unavailable(
             "no_weather_feed",
@@ -914,6 +1313,38 @@ async def radio(limit: int = 30) -> dict[str, Any]:
     """
     if state.replayer is None:
         return _unavailable("no_replay_session_cached")
+
+    if state.mode == "LIVE":
+        # The hub sends its own captions with each call, so a live session
+        # needs no download and no transcription: the words arrive with the
+        # audio.
+        rows = _optional(state.replayer, "recent_radio", limit) or []
+        drivers = (
+            state.livetiming.source.state.drivers if state.livetiming is not None else {}
+        )
+        calls: list[dict[str, Any]] = []
+        for row in rows:
+            number = row.get("driver_number")
+            meta = drivers.get(int(number), {}) if number is not None else {}
+            calls.append(
+                {
+                    "date": row.get("date"),
+                    "driver_number": number,
+                    "team": meta.get("team"),
+                    "text": row.get("text"),
+                    "recording_url": None,
+                    "duration": None,
+                }
+            )
+        return {
+            "available": bool(calls),
+            "source": "livetiming.team_radio" if calls else "unavailable",
+            "reason": "" if calls else "no_radio_feed",
+            "count": len(calls),
+            "transcribed": len(calls),
+            "pending": 0,
+            "messages": calls,
+        }
 
     directory = SESSION_DIR / str(state.replayer.session_key)
     messages = load_cached_radio(directory)
@@ -952,7 +1383,8 @@ async def radio(limit: int = 30) -> dict[str, Any]:
     # happened by now are shown, so a call appears at the moment it is made
     # rather than the whole session appearing at once.
     if state.replayer is not None:
-        position = state.replayer.clock.position_ns
+        clock = getattr(state.replayer, "clock", None)
+        position = getattr(clock, "position_ns", 0) if clock is not None else 0
         if position:
             upto = datetime.fromtimestamp(position / 1e9, tz=UTC)
             in_play = []
@@ -1006,10 +1438,8 @@ async def messages(limit: int = 12) -> dict[str, Any]:
         return _unavailable("no_replay_session_cached")
     return {
         "available": True,
-        "source": "openf1.race_control",
-        "messages": state.replayer.recent_messages(
-            state.replayer.clock.position_ns, limit=limit
-        ),
+        "source": "openf1.race_control" if state.mode == "REPLAY" else "livetiming",
+        "messages": _recent_messages(limit),
     }
 
 

@@ -84,7 +84,7 @@ export default function PitWallApp() {
     const load = async () => {
       const [sessionData, outlineData, driverData, constructorData, frameData] = await Promise.all([
         api.currentSession(),
-        api.outline('Austin', 2024),
+        api.currentOutline(),
         api.driverStandings(),
         api.constructorStandings(),
         api.frame(),
@@ -98,7 +98,11 @@ export default function PitWallApp() {
       }
 
       if (isUnavailable(outlineData)) {
-        setError(`Circuit outline unavailable: ${outlineData.reason}`)
+        // A live session builds its map from the cars' own positions, so an
+        // outline that is still filling in is expected, not an error.
+        if (outlineData.reason !== 'track_still_building') {
+          setError(`Circuit outline unavailable: ${outlineData.reason}`)
+        }
       } else {
         setOutline(outlineData)
       }
@@ -265,6 +269,7 @@ export default function PitWallApp() {
   useEffect(() => {
     if (view !== 'live') return
     let cancelled = false
+    let ticks = 0
 
     const load = async () => {
       const [report, weatherData, radioData] = await Promise.all([
@@ -276,6 +281,14 @@ export default function PitWallApp() {
       if (!isUnavailable(report)) setStrategy(report)
       if (!isUnavailable(weatherData)) setWeather(weatherData)
       if (!isUnavailable(radioData)) setRadio(radioData)
+
+      // The live track fills in as the cars circulate, so the map is
+      // refreshed while a session is running.
+      ticks += 1
+      if (ticks % 3 === 0) {
+        const outlineData = await api.currentOutline()
+        if (!cancelled && !isUnavailable(outlineData)) setOutline(outlineData)
+      }
     }
 
     load()
@@ -821,11 +834,16 @@ export default function PitWallApp() {
           <div className="flex flex-wrap items-center justify-between gap-4 pb-5 border-b border-zinc-900 light:border-zinc-200">
             <div>
               <h2 className="text-3xl font-black italic uppercase tracking-wider text-white light:text-zinc-900 font-sans">
-                Pit Wall Live — {circuitFacts.circuit} GP
+                Pit Wall Live —{' '}
+                {session?.mode === 'LIVE' && circuitFacts.name
+                  ? circuitFacts.name
+                  : `${circuitFacts.circuit} GP`}
               </h2>
               <p className="text-zinc-300 light:text-zinc-700 text-sm font-mono mt-1 font-semibold">
-                {circuitFacts.circuit.toUpperCase()} {circuitFacts.year} · LAP{' '}
-                {frame?.lap ?? '—'} OF {frame?.total_laps ?? '—'}
+                {circuitFacts.circuit.toUpperCase()} {circuitFacts.year} ·{' '}
+                {frame?.total_laps
+                  ? `LAP ${frame?.lap ?? '—'} OF ${frame.total_laps}`
+                  : String(circuitFacts.name).toUpperCase()}
               </p>
             </div>
             <span
@@ -861,7 +879,8 @@ export default function PitWallApp() {
                   <div className="flex items-center space-x-3">
                     <span className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse" />
                     <span className="text-xs font-mono font-black text-zinc-200 light:text-zinc-800 uppercase tracking-widest">
-                      {circuitFacts.circuit} Circuit — GPS Telemetry Map
+                      {circuitFacts.circuit} Circuit —{' '}
+                      {session?.mode === 'LIVE' ? 'Live positions' : 'GPS Telemetry Map'}
                     </span>
                   </div>
                   <span className="text-xs font-mono px-3 py-1 rounded bg-zinc-900 light:bg-zinc-100 text-emerald-400 border border-zinc-800 light:border-zinc-200 font-bold">
@@ -879,7 +898,13 @@ export default function PitWallApp() {
                     />
                   </div>
                 ) : (
-                  <Unavailable reason="Circuit outline unavailable" />
+                  <Unavailable
+                    reason={
+                      session?.mode === 'LIVE'
+                        ? 'Building the track from the live positions…'
+                        : 'Circuit outline unavailable'
+                    }
+                  />
                 )}
                 {drivers.length > 0 && (
                   <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1.5 font-mono text-[10px] text-zinc-500 light:text-zinc-500">

@@ -99,6 +99,21 @@ class TickLoop:
         with contextlib.suppress(ValueError):
             self._listeners.remove(queue)
 
+    @property
+    def is_running(self) -> bool:
+        return bool(self._running and self._task is not None and not self._task.done())
+
+    def take_clients_from(self, other: TickLoop) -> None:
+        """Move the connected browsers onto this loop.
+
+        When the pit wall switches between the replay and a live feed it
+        builds a new loop, and the browsers are already subscribed to the old
+        one.  Without this they would keep receiving the old source's frames
+        for ever - the app would still show the replay during a live session.
+        """
+        self._listeners = other._listeners
+        other._listeners = []
+
     def _broadcast(self, message: dict[str, Any]) -> None:
         for queue in list(self._listeners):
             with contextlib.suppress(asyncio.QueueFull):
@@ -125,15 +140,20 @@ class TickLoop:
             return
         self._alert_keys = set(data.get("alert_keys") or [])
         elapsed = data.get("elapsed_s")
-        if elapsed:
-            self.replayer.seek(float(elapsed))
+        seek = getattr(self.replayer, "seek", None)
+        if elapsed and seek is not None:
+            seek(float(elapsed))
         logger.info("resumed session %s at %.1fs", self.replayer.session_key, elapsed or 0)
 
     def _save_snapshot(self) -> None:
+        clock = getattr(self.replayer, "clock", None)
+        if clock is None:
+            # A live session has no replay clock to remember.
+            return
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "session_key": self.replayer.session_key,
-            "elapsed_s": self.replayer.clock.elapsed_s,
+            "elapsed_s": clock.elapsed_s,
             "alert_keys": sorted(self._alert_keys),
             "saved_at": datetime.now(UTC).isoformat(),
         }
@@ -181,7 +201,10 @@ class TickLoop:
         """Advance one tick and return the new state."""
         if self.speed > 0:
             self._rewind_if_finished()
-            self.replayer.advance(self.interval * self.speed)
+            # A live source advances itself: the hub pushes the new state.
+            advance = getattr(self.replayer, "advance", None)
+            if advance is not None:
+                advance(self.interval * self.speed)
         frame = self.replayer.frame(replay_speed=self.speed)
         state = project_frame(frame, self.projection)
         state["available"] = True

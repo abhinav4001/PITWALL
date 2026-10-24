@@ -176,6 +176,29 @@ def test_alerts_are_broadcast_only_once(loop: TickLoop) -> None:
     assert first.alerts == [] and second.alerts == []
 
 
+def test_the_browser_moves_with_the_source(tmp_path: Path) -> None:
+    """Switching to a live source must carry the open browser across.
+
+    The page subscribes to one loop.  If the new loop does not take the
+    subscribers with it, the browser keeps receiving the replay's frames -
+    which is how a live practice session stayed hidden behind the 2024 race.
+    """
+    directory = tmp_path / "1"
+    _build_pack(directory)
+    pack = SessionPack.load(1, tmp_path)
+    projection = TrackProjection.from_outline(
+        [(0.0, 0.0), (1000.0, 0.0), (1000.0, 1000.0)]
+    )
+    old = TickLoop(SessionReplayer(pack), projection, None, snapshot_dir=tmp_path / "snap")
+    new = TickLoop(SessionReplayer(pack), projection, None, snapshot_dir=tmp_path / "snap")
+
+    queue = old.subscribe()
+    new.take_clients_from(old)
+
+    assert old._listeners == []
+    assert new._listeners == [queue]
+
+
 def test_snapshot_resumes_the_clock(tmp_path: Path) -> None:
     directory = tmp_path / "1"
     _build_pack(directory)

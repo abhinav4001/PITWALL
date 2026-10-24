@@ -771,3 +771,70 @@ actually moving before assuming the loop is broken.
 
 
 
+
+## Session 2026-10-24 - the hub answers, and what it actually sends
+
+### 37. The invocation had no `invocationId`, so the snapshot never came
+
+Three things have to be right at once for the F1 hub to hand over a session,
+and only the first was obviously wrong:
+
+1. **Subscribe takes one argument** - the list of topics - so the SignalR
+   arguments array is *nested*: `"arguments": [[...]]`.  Sent flat, the hub
+   receives `"Heartbeat"` as a bare string for a `List<string>` parameter.
+2. **`invocationId` must be present.**  Without it SignalR treats the call as
+   a fire-and-forget *send*: the method still runs, but the server does not
+   reply, and the **completion is the snapshot**.  `SessionInfo`, `DriverList`
+   and the first positions only exist there.
+3. **The session arrives in the completion**, not as an invocation.
+
+Measured, 2026-10-24 14:11 UTC: with `{type:1, invocationId:"0",
+target:"Subscribe", arguments:[[...]]}` the socket reports `subscribed: true`
+and the completion carries ten topics at once - `Heartbeat`, `SessionInfo`,
+`SessionStatus`, `DriverList`, `TimingData`, `TimingAppData`, `TrackStatus`,
+`WeatherData`, `TeamRadio`, `RaceControlMessages`.  With the previous frame
+(no id, flat arguments) the socket stayed open and delivered nothing, which
+reads exactly like "no session is running".
+
+### 38. A finished session is still in the snapshot
+
+The completion named `Practice 2`, key 11390, **the day after it ran**, with
+`SessionStatus.Status = "Finalised"`.  Presence of a key therefore proves
+nothing.  `session_is_running()` now requires a status of `Started` /
+`InProgress`, or - when the status is missing - the published
+`StartDate`/`EndDate` window.  Without it the app sat in LIVE with zero cars,
+and would have flapped between LIVE and REPLAY every minute.
+
+### 39. Radio captions can be metadata with the words inside
+
+`TeamRadio` is usually `{"<drv>-<utc>": {"Utc": ..., "Captions": "1: ..."}}`,
+but a caption has been seen as a JSON *string* holding
+`{"RacingNumber","Path","Captions"}`.  Both are unwrapped, and calls are
+de-duplicated on `(Utc, words)` because every later snapshot repeats them.
+No transcription is needed for a live session - F1 publishes the text.
+
+### 40. Not every position sample belongs on the map
+
+`Position.z` reports cars in the garage as well, and those points would
+stretch the outline over the pit lane.  Samples for a car whose status is
+`OffTrack` are still drawn (the car is real) but no longer build the track
+extent or the traced outline.
+
+### 41. The live switch left the browser on the replay
+
+The page subscribes to one `TickLoop`.  Swapping `state.loop` for a live one
+without moving the subscribers across left the browser receiving the 2024
+replay for ever - the live session was up, and the screen did not change.
+`TickLoop.take_clients_from()` now carries every queue over, and the old loop
+is stopped.  The live source also had no `advance()`/`clock`, which the loop
+called unconditionally; both are now optional, which a test ticks end to end.
+
+### 42. When the next session is due, look harder
+
+The hub keeps one subscription for the day, but a subscription made before a
+session starts can stay silent.  While the pit wall is on the replay it
+reopens the socket every 30 minutes (never carried anything), every 20
+minutes (a session has been seen and finished), or every **2 minutes** from
+five minutes before the calendar's next start until an hour after it.  The
+calendar comes from OpenF1 and is cached for ten minutes, so the free tier is
+barely touched.

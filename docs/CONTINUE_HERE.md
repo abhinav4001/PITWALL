@@ -1,6 +1,7 @@
-# Continue here — 2026-10-22, session 3 (evening)
+# Continue here — 2026-10-24, session 4
 
-Work is committed; the tree is clean. Read this first, then
+Work is committed as of the previous checkpoint; the changes below are the
+live-feed fixes made on 24 October. Read this first, then
 `docs/LEARNING_LOG.md` for the measurements behind every claim.
 
 ---
@@ -35,28 +36,39 @@ The handshake, measured:
 ```
 POST /signalrcore/negotiate?negotiateVersion=1   body []      -> 200 + token
 wss://livetiming.formula1.com/signalrcore?id=<token>              -> handshake "{}"
-{"type":1,"target":"Subscribe","arguments":[...topics...]}        -> accepted
+{"type":1,"invocationId":"0","target":"Subscribe","arguments":[[...topics...]]}
+                                                                  -> completion (type 3)
 ```
 
-Three details that cost time and are worth keeping:
+Four details that cost time and are worth keeping:
 
 * the negotiate is **POST**, not GET (GET answers 405);
 * the token **must be URL-encoded** — SignalR tokens are base64 and can
   contain `+`, `/` and `=`, and an unencoded `/` truncates the path so the
   server answers **404**, which looks exactly like a wrong endpoint;
 * the URL form is `?id=<token>`; LiveF1's
-  `/connect?transport=webSockets&connectionToken=…` answers **401**.
+  `/connect?transport=webSockets&connectionToken=…` answers **401**;
+* `Subscribe` takes **one** argument — the list of topics — so the arguments
+  are nested (`[[...]]`), and it needs an **`invocationId`**. Without the id
+  the hub treats the call as a send and never replies — and the reply (the
+  completion's `result`) is the **only** place the current session snapshot
+  is handed over.
 
 **The hub throttles.** Six or seven negotiate-and-connect cycles in quick
 succession are answered; after that the upgrade answers **404** until the
 budget refills. The client backs off exponentially (15/30/60/120/300 s) and
 the app retries on its 60 s watcher. Verified: the app reconnected by itself.
 
-The hub carries everything a pit wall needs: `CarData.z` (position, speed,
-throttle, brake, gear, RPM, DRS, compound, tyre life), `Position.z`,
-`TimingData.z` (lap times and the gap to the car ahead), `WeatherData.z`,
-`RaceControlMessages.z`, `SessionInfo.z` — and `TeamRadio.z`, which carries
-the radio **as text**, so live radio needs no speech recognition.
+The hub carries everything a pit wall needs. Only **two** topics are
+compressed (`CarData.z`, `Position.z`, base64 of a raw-deflate stream);
+every other topic is plain JSON — subscribing to `SessionInfo.z` or
+`TimingData.z` delivers nothing at all. Observed in one completion:
+`Heartbeat`, `SessionInfo`, `SessionStatus`, `DriverList`, `TimingData`,
+`TimingAppData`, `TrackStatus`, `WeatherData`, `TeamRadio`,
+`RaceControlMessages`. `CarData` gives rpm/speed/gear/throttle/brake/DRS
+(no position, no compound); `Position` gives X/Y in the feed's own frame;
+compound and tyre life come from `TimingAppData`. `TeamRadio` carries the
+radio **as text**, so live radio needs no speech recognition.
 
 The historical archive (`/static/…/*.jsonStream`) is still gated and the
 token does not unlock it; the **audio assets**
@@ -89,6 +101,9 @@ replay-compatible surface the OpenF1 adapter presents).
 | "like this text please remove from everywhere" | **Removed** | "Session 9617 • REPLAY • Lap 19/56 • Real OpenF1 telemetry", "AUSTIN 2024 • REPLAY • SESSION 9617" and "154 readings \| rain risk 0%" are all gone. |
 | "please everything more polished and error free" | **Done** | Also found: OpenF1 has only 2 laps for Hamilton in the 2024 race (verified upstream, not a broken download), so the pit wall was showing him P20 with a stale gap. He is now marked **out** and left out of the forecast. |
 | "please confirm that we are using the new api for all purposes" | **Yes, with one honest caveat** | Live timing, telemetry, positions, gaps, flags, weather and radio all come from **F1's own hub**. The **archive** comes from OpenF1, because F1's historical `.jsonStream` files are gated (401) while its radio MP3s are not. |
+| "still showing 2024 Austin while a practice is on" | **Root cause fixed** | Four faults at once: invented `.z` topic names, no base64/deflate decode, the completion message ignored, and no keepalive. Then two more: the Subscribe call had no `invocationId` (so the snapshot was never sent), and a *finished* session still counted as live. |
+| "the page kept showing the replay after the switch" | **Fixed** | The browser subscribes to one tick loop; swapping the source left it on the old one. `TickLoop.take_clients_from()` carries the subscribers across. |
+| "will it pick up today's session?" | **Made likely, and checkable** | While no session runs the hub subscription is reopened every 30 min (nothing ever received), every 20 min (a session has finished), or every **2 min** in the window around the calendar's next start. `python scripts/check_live.py` prints exactly what the backend sees. |
 
 
 ---
@@ -187,28 +202,35 @@ tyre     "MEDIUM | age 12 L | Degradation +0.32s | 44 laps of stint left |
 strategy "HOLD | Stay on Mediums | Best window: lap 25-36 |
           P1 WHERE YOU END UP | ahead of VER"
 radio    "81 calls shown, 81 transcribed, none pending"
-live     { "hub_connected": true, "hub_error": null, "session": null }
+live     { "hub_connected": true, "hub_subscribed": true,
+           "session": null, "frames_received": 10, "bad_frames": 0 }
 ```
 
-`session: null` is correct — no session is running. The next is **Austin
-Practice 1, 23 Oct 17:30 UTC**; the app will switch to it by itself.
+A finished session stays in `session` (the hub keeps the last one) but the
+app stays on the replay until `session_is_running()` says otherwise. The next
+one is **Austin Practice 3, 24 Oct 17:30 UTC**; the app will switch to it by
+itself, and `python scripts/check_live.py` reports what it sees.
 
 ---
 
 ## 8. What is left
 
-1. **`README.md`, `docs/ARCHITECTURE.md`, `docs/DEMO.md`** — still missing
+1. **Watch the live switch on Austin Practice 3** (24 Oct 17:30 UTC) — the
+   first real test of the hub path with a session running. Run
+   `python scripts/check_live.py` during the session: it prints the mode, the
+   subscribed topics, the parsed drivers and any undecodable frames.
+2. **`README.md`, `docs/ARCHITECTURE.md`, `docs/DEMO.md`** — still missing
    (milestone M9).
-2. **Rolling 2026 evaluation** — `eval/rolling_eval.py` is still a stub (M5).
-3. **Traffic model (ADR-3 L0→L2), SC/VSC hazard model, precompute (ADR-6)**.
-4. **Debrief screen** — spec 12.1 wants a post-race divergence chart and a
+3. **Rolling 2026 evaluation** — `eval/rolling_eval.py` is still a stub (M5).
+4. **Traffic model (ADR-3 L0→L2), SC/VSC hazard model, precompute (ADR-6)**.
+5. **Debrief screen** — spec 12.1 wants a post-race divergence chart and a
    season scorecard.
-5. **LLM layer (M6)** — blocked on **D2** (OmniRoute key; the gateway still
+6. **LLM layer (M6)** — blocked on **D2** (OmniRoute key; the gateway still
    answers 401). The app runs on the deterministic engine meanwhile.
-6. **Priority circuits for calibration** — Austin 2024 and 2025 are done;
-   Silverstone, Monza and Spa are not (D4).
-7. **Watch the live switch on Austin P1** (23 Oct 17:30 UTC) — the first
-   real test of the hub path with a session running.
+7. **Priority circuits for calibration** — Austin 2024 and 2025 are done;
+   Silverstone, Monza and Spa are not (D4). A live 2026 session has no bundle,
+   so the strategy card honestly reports itself unavailable instead of
+   inventing a forecast.
 
 ---
 

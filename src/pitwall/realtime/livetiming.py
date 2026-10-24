@@ -38,11 +38,13 @@ one later if F1 ever reopens it.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import time
+import zlib
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import quote
 
@@ -67,21 +69,45 @@ SEPARATOR = "\x1e"
 HUB_NAME = "Streaming"
 
 #: The topics a pit wall needs.
+#:
+#: Only **two** of the feed's topics are compressed (``CarData.z`` and
+#: ``Position.z``); every other topic is sent as plain JSON, and asking for
+#: ``SessionInfo.z`` or ``TimingData.z`` subscribes to a topic that does not
+#: exist, which silently delivers nothing at all.  The list below is pinned
+#: against FastF1's reference client (``fastf1/livetiming/client.py``).
 TOPICS = (
-    "SessionInfo.z",
-    "SessionStatus.z",
-    "DriverList.z",
-    "LiveTimingData.z",
+    "Heartbeat",
+    "SessionInfo",
+    "SessionStatus",
+    "DriverList",
+    "TimingData",
+    "TimingAppData",
+    "TrackStatus",
+    "LapCount",
+    "WeatherData",
+    "TeamRadio",
+    "RaceControlMessages",
     "CarData.z",
     "Position.z",
-    "TimingData.z",
-    "WeatherData.z",
-    "TeamRadio.z",
-    "RaceControlMessages.z",
 )
+
+#: How often the client pings the hub.  SignalR drops a connection that has
+#: been silent for 30 s, so without this the socket dies between sessions.
+PING_INTERVAL_S = 15.0
 
 #: F1 reports the team colour as a bare hex string, without the "#".
 DEFAULT_TEAM_COLOUR = "#71717a"
+
+#: The telemetry channels inside ``CarData.z``, keyed by channel number.
+#: Pinned against FastF1's parser, which reads the same five indices.
+CAR_CHANNELS = {
+    "rpm": "0",
+    "speed": "2",
+    "gear": "3",
+    "throttle": "4",
+    "brake": "5",
+    "drs": "45",
+}
 
 _HEADERS = {
     "User-Agent": (
@@ -112,6 +138,93 @@ def _number(value: Any) -> float | None:
         return None
 
 
+def _parse_utc(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+#: Session statuses that mean the session is no longer running.
+ENDED_STATUSES = frozenset({"finalised", "finalized", "ended", "aborted", "cancelled"})
+
+#: Session statuses that mean the session is running now.
+RUNNING_STATUSES = frozenset({"started", "inprogress", "in progress"})
+
+
+def session_is_running(session: dict[str, Any], now: datetime | None = None) -> bool:
+    """Whether the hub is describing a session that is running now.
+
+    The hub keeps the **last** session in its snapshot after it has finished,
+    so the presence of a session key proves nothing on its own: without this
+    check a finished practice would be presented as live for ever, with no
+    cars on track and nothing updating.
+    """
+    if not session or not session.get("Key"):
+        return False
+    status = session.get("SessionStatus") or {}
+    value = str(status.get("Status") or "").strip().lower() if isinstance(status, dict) else ""
+    if value in RUNNING_STATUSES:
+        return True
+    if value in ENDED_STATUSES:
+        return False
+    # No usable status: fall back on the published window.  The margin lets a
+    # session that starts early still count, and a race that overruns still
+    # count while it is being run.
+    moment = now or datetime.now(UTC)
+    start = _parse_utc(session.get("StartDate"))
+    end = _parse_utc(session.get("EndDate"))
+    if start is None or end is None:
+        return False
+    return start - timedelta(minutes=15) <= moment <= end + timedelta(minutes=45)
+
+
+def _decode(payload: Any) -> Any:
+    """Decode one hub payload.
+
+    Two wire formats arrive on this feed:
+
+    * most topics send a **JSON string**, which is either the whole object or
+      a quoted JSON string,
+    * ``CarData.z`` and ``Position.z`` send **base64 of a raw-deflate stream**.
+
+    Both are pinned against FastF1's own parser, which does
+    ``zlib.decompress(base64.b64decode(text), -zlib.MAX_WBITS)`` for the
+    ``.z`` topics.  Decoding is attempted by shape rather than by topic name,
+    so a topic that changes format still parses.
+    """
+    if isinstance(payload, (dict, list)):
+        return payload
+    if not isinstance(payload, str):
+        return None
+    text = payload.strip()
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        text = text[1:-1]
+    if text[:1] in ("{", "["):
+        try:
+            return json.loads(text)
+        except ValueError:
+            return None
+    compact = "".join(text.split())
+    try:
+        raw = base64.b64decode(compact)
+    except Exception:  # noqa: BLE001 - not a compressed payload
+        return None
+    for wbits in (-zlib.MAX_WBITS, zlib.MAX_WBITS):
+        try:
+            decoded = zlib.decompress(raw, wbits)
+        except zlib.error:
+            continue
+        try:
+            return json.loads(decoded.decode("utf-8-sig"))
+        except (UnicodeDecodeError, ValueError):
+            return None
+    return None
+
+
 @dataclass
 class HubState:
     """Everything the hub has told us so far."""
@@ -121,9 +234,25 @@ class HubState:
     cars: dict[int, dict[str, Any]] = field(default_factory=dict)
     order: dict[int, int] = field(default_factory=dict)
     timing: dict[int, dict[str, Any]] = field(default_factory=dict)
+    tyres: dict[int, dict[str, Any]] = field(default_factory=dict)
     weather: list[dict[str, Any]] = field(default_factory=list)
     radio: list[dict[str, Any]] = field(default_factory=list)
     messages: list[dict[str, Any]] = field(default_factory=list)
+    #: ``LapCount``, e.g. ``{"CurrentLap": 12, "TotalLaps": 56}``.
+    lap_count: dict[str, Any] = field(default_factory=dict)
+    #: ``ExtrapolatedClock``, e.g. ``{"Remaining": "1:12:30", "Extrapolating": True}``.
+    clock: dict[str, Any] = field(default_factory=dict)
+    #: ``TrackStatus``, e.g. ``{"Status": "1", "Message": "AllClear"}``.
+    track_status: dict[str, Any] = field(default_factory=dict)
+    #: How many frames of each topic have been parsed, for diagnosis.
+    topics: dict[str, int] = field(default_factory=dict)
+    #: When the last frame of any topic arrived.
+    last_frame_at: datetime | None = None
+    #: Every JSON frame received, whatever its type - including handshake and
+    #: ping traffic.  Zero means the socket is open but deaf.
+    frames_received: int = 0
+    #: Frames that could not be decoded - the honest measure of a broken feed.
+    bad_frames: int = 0
 
     @property
     def has_data(self) -> bool:
@@ -150,11 +279,20 @@ class LivetimingLiveSource:
         self.state = HubState()
         self.last_error: str | None = None
         self.connected = False
+        #: Whether the hub accepted the subscription.  A socket can be open
+        #: and still carry nothing, so this is reported separately.
+        self.subscribed = False
         self._ws: Any = None
         self._reader: asyncio.Task[None] | None = None
+        self._pinger: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._attempted_at: float = 0.0
         self._backoff: float = reconnect_delay
+        #: Per-driver position history, for the live track outline.
+        self._tracks: dict[int, list[tuple[float, float, float]]] = {}
+        #: min_x, max_x, min_y, max_y of every position ever seen.
+        self._extent: list[float] | None = None
+        self._position_count = 0
 
     # ------------------------------------------------------------------
     # connection
@@ -203,29 +341,77 @@ class LivetimingLiveSource:
 
         await self._ws.send(json.dumps({"protocol": "json", "version": 1}) + SEPARATOR)
         await self._ws.recv()  # the handshake response
-        await self._ws.send(
-            json.dumps(
-                {"type": 1, "target": "Subscribe", "arguments": list(self.topics)}
-            )
-            + SEPARATOR
-        )
+        await self._ws.send(self._subscribe_frame())
         self.connected = True
+        self.subscribed = False
         self.last_error = None
         self._backoff = self.reconnect_delay
         self._stop.clear()
         self._reader = asyncio.create_task(self._read())
+        if self._pinger is not None and not self._pinger.done():
+            self._pinger.cancel()
+        self._pinger = asyncio.create_task(self._ping())
         logger.info("livetiming: connected and subscribed to %d topics", len(self.topics))
         return True
 
+    def _subscribe_frame(self) -> str:
+        """The ``Subscribe`` invocation, in SignalR's argument-array form.
+
+        ``Subscribe`` takes **one** argument - the list of topics - so the
+        arguments must be nested: ``[[...]]``.  Sending the topics flat passes
+        the first topic as a bare string, and the hub answers with an error
+        completion that is easy to miss: the socket still looks connected, but
+        nothing ever arrives.
+
+        The ``invocationId`` matters too.  Without it SignalR treats the call
+        as a fire-and-forget *send*, so the hub never returns the completion
+        whose result is the whole session snapshot - the first ``SessionInfo``,
+        ``DriverList`` and positions would all be lost.
+        """
+        return (
+            json.dumps(
+                {
+                    "type": 1,
+                    "invocationId": "0",
+                    "target": "Subscribe",
+                    "arguments": [list(self.topics)],
+                }
+            )
+            + SEPARATOR
+        )
+
+    async def _ping(self) -> None:
+        """Keep the socket alive.
+
+        SignalR drops a connection that has sent nothing for 30 s.  Between
+        sessions the hub has nothing to say, so without this the socket is
+        closed, the client reconnects, and the reconnect budget is spent
+        before the session even starts - which is exactly how a live session
+        ends up never being seen.
+        """
+        ping = json.dumps({"type": 6}) + SEPARATOR
+        while not self._stop.is_set():
+            try:
+                await asyncio.sleep(PING_INTERVAL_S)
+                if self._ws is None:
+                    return
+                await self._ws.send(ping)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the reader handles a dead socket
+                return
+
     async def aclose(self) -> None:
         self._stop.set()
-        if self._reader is not None:
-            self._reader.cancel()
-            try:
-                await self._reader
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-            self._reader = None
+        for task in (self._pinger, self._reader):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
+        self._pinger = None
+        self._reader = None
         if self._ws is not None:
             try:
                 await self._ws.close()
@@ -233,6 +419,7 @@ class LivetimingLiveSource:
                 pass
             self._ws = None
         self.connected = False
+        self.subscribed = False
 
     async def _read(self) -> None:
         """Read frames until the connection drops, then reconnect.
@@ -267,137 +454,294 @@ class LivetimingLiveSource:
         try:
             message = json.loads(frame)
         except ValueError:
+            self.state.bad_frames += 1
             return
-        if message.get("type") != 1:
+        self.state.frames_received += 1
+        kind = message.get("type")
+        # Type 3 is the completion of our Subscribe call: its result *is* the
+        # full live-timing snapshot, topic by topic.  It is the only place the
+        # current session state is ever handed over, so ignoring it loses
+        # SessionInfo, DriverList and the first positions entirely.
+        if kind == 3:
+            if message.get("error"):
+                self.state.bad_frames += 1
+                self.last_error = f"subscribe failed: {message['error']}"
+                logger.warning("livetiming: subscribe rejected: %s", message["error"])
+                return
+            self.subscribed = True
+            result = message.get("result")
+            if isinstance(result, dict):
+                for topic, value in result.items():
+                    self._dispatch(str(topic), _decode(value))
+            return
+        if kind != 1:
             return
         topic = message.get("target") or ""
         arguments = message.get("arguments") or []
         if not arguments:
             return
-        payload = arguments[0]
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except ValueError:
-                return
+        self._dispatch(topic, _decode(arguments[0]))
+
+    def _dispatch(self, topic: str, payload: Any) -> None:
         if not isinstance(payload, dict):
+            if payload is not None:
+                self.state.bad_frames += 1
             return
         # "CarData.z" -> "_on_CarData"
         name = topic[:-2] if topic.endswith(".z") else topic
         handler = getattr(self, f"_on_{name}", None)
         if handler is None:
             return
+        self.state.topics[topic] = self.state.topics.get(topic, 0) + 1
+        self.state.last_frame_at = datetime.now(UTC)
         try:
             handler(payload)
         except Exception as exc:  # noqa: BLE001 - one bad frame must not kill it
+            self.state.bad_frames += 1
             logger.debug("livetiming: %s failed: %s", topic, exc)
 
     def _on_LiveTimingData(self, payload: dict[str, Any]) -> None:
-        """The full snapshot the hub sends when you subscribe."""
-        self._on_SessionInfo(payload.get("SessionInfo") or {})
-        self._on_DriverList(payload.get("DriverList") or {})
-        self._on_CarData(payload.get("CarData") or {})
-        self._on_Position(payload.get("Position") or {})
-        self._on_TimingData(payload.get("TimingData") or {})
-        self._on_WeatherData(payload.get("WeatherData") or {})
-        self._on_TeamRadio(payload.get("TeamRadio") or {})
-        self._on_RaceControlMessages(payload.get("RaceControlMessages") or {})
+        """A whole snapshot, if the hub ever sends one as a single topic."""
+        for topic, value in payload.items():
+            self._dispatch(str(topic), _decode(value))
 
+    # ------------------------------------------------------------------
+    # session
+    # ------------------------------------------------------------------
     def _on_SessionInfo(self, payload: dict[str, Any]) -> None:
         if payload:
-            self.state.session = payload
+            # The feed sends deltas: a field that is not in this frame is
+            # unchanged, so the session is merged rather than replaced.
+            before = self.state.session.get("Key")
+            self.state.session.update(payload)
+            after = self.state.session.get("Key")
+            if after and after != before:
+                logger.info(
+                    "livetiming: session %s %s (%s)",
+                    after,
+                    self.state.session.get("Name"),
+                    self.state.session.get("Type"),
+                )
 
     def _on_SessionStatus(self, payload: dict[str, Any]) -> None:
         if payload:
-            self.state.session.update(payload)
+            self.state.session.setdefault("SessionStatus", {})
+            status = self.state.session["SessionStatus"]
+            if isinstance(status, dict):
+                status.update(payload)
+            self.state.session.update({k: v for k, v in payload.items() if k != "Status"})
 
+    def _on_TrackStatus(self, payload: dict[str, Any]) -> None:
+        if payload:
+            self.state.track_status = payload
+
+    def _on_LapCount(self, payload: dict[str, Any]) -> None:
+        if payload:
+            self.state.lap_count.update(payload)
+
+    def _on_ExtrapolatedClock(self, payload: dict[str, Any]) -> None:
+        if payload:
+            self.state.clock.update(payload)
+
+    def _on_Heartbeat(self, payload: dict[str, Any]) -> None:
+        """The heartbeat carries the hub's clock; nothing to store."""
+
+    def _on_SessionData(self, payload: dict[str, Any]) -> None:
+        """Series/status metadata; not needed for the pit wall."""
+
+    # ------------------------------------------------------------------
+    # drivers
+    # ------------------------------------------------------------------
     def _on_DriverList(self, payload: dict[str, Any]) -> None:
-        for row in payload.get("Entries") or []:
-            number = row.get("Number")
-            if number is None:
-                continue
-            self.state.drivers[int(number)] = {
-                "driver_number": int(number),
-                "code": row.get("Code"),
-                "name": row.get("FullName"),
-                "broadcast_name": row.get("BroadcastName"),
-                "team": row.get("Team"),
-                "team_colour": _colour(row.get("TeamColour")),
-                "country": row.get("CountryName"),
-                "number": row.get("RacingNumber"),
-            }
-
-    def _on_CarData(self, payload: dict[str, Any]) -> None:
-        for key, row in (payload.get("Entries") or {}).items():
-            number = row.get("Number", key)
+        for number, row in (payload.get("Entries") or {}).items():
             try:
-                number = int(number)
+                number = int(row.get("RacingNumber") or number)
             except (TypeError, ValueError):
                 continue
-            meta = (row.get("Meta") or {}).get("Driver") or {}
-            existing = self.state.cars.get(number, {})
+            existing = self.state.drivers.get(number, {})
             existing.update(
                 {
                     "driver_number": number,
-                    "x": _number(row.get("X")),
-                    "y": _number(row.get("Y")),
-                    "z": _number(row.get("Z")),
-                    "speed": _number(row.get("Speed")),
-                    "throttle": _number(row.get("Throttle")),
-                    "brake": _number(row.get("Brake")),
-                    "n_gear": int(row.get("Gear") or 0),
-                    "rpm": _number(row.get("RPM")),
-                    "drs": int(row.get("DRS") or 0),
-                    "compound": row.get("Compound"),
-                    "tyre_age": row.get("TyreLife"),
-                    "lap": row.get("Lap"),
-                    "total_laps": row.get("TotalLaps"),
-                    "position": row.get("Position"),
-                    "status": row.get("Status"),
-                    "code": meta.get("Code") or existing.get("code"),
-                    "name": meta.get("FullName") or existing.get("name"),
-                    "team": meta.get("Team") or existing.get("team"),
-                    "team_colour": _colour(meta.get("TeamColour") or existing.get("team_colour")),
+                    "code": row.get("Tla") or row.get("Code") or existing.get("code"),
+                    "name": row.get("FullName") or existing.get("name"),
+                    "broadcast_name": row.get("BroadcastName"),
+                    "team": row.get("TeamName") or row.get("Team"),
+                    "team_colour": _colour(
+                        row.get("TeamColour") or existing.get("team_colour")
+                    ),
+                    "country": row.get("CountryCode"),
+                    "number": row.get("RacingNumber"),
                 }
             )
-            self.state.cars[number] = existing
+            self.state.drivers[number] = existing
+
+    def _on_CarData(self, payload: dict[str, Any]) -> None:
+        """``CarData.z``: telemetry channels, no position.
+
+        The live shape is ``{"Entries": [{"Utc": ..., "Cars": {<drv>:
+        {"Channels": {"0": rpm, "2": speed, ...}}}}]}`` - a *list* of samples,
+        with the values under numbered channels rather than named fields.
+        """
+        entries = payload.get("Entries")
+        samples = entries if isinstance(entries, list) else []
+        if isinstance(entries, dict):
+            samples = [{"Cars": entries}]
+        for sample in samples:
+            cars = (sample or {}).get("Cars") or {}
+            for key, row in cars.items():
+                try:
+                    number = int(key)
+                except (TypeError, ValueError):
+                    continue
+                channels = row.get("Channels") or {}
+                if not isinstance(channels, dict):
+                    continue
+                car = self.state.cars.setdefault(number, {"driver_number": number})
+                car.update(
+                    {
+                        "rpm": _number(channels.get(CAR_CHANNELS["rpm"])),
+                        "speed": _number(channels.get(CAR_CHANNELS["speed"])),
+                        "n_gear": _number(channels.get(CAR_CHANNELS["gear"])),
+                        "throttle": _number(channels.get(CAR_CHANNELS["throttle"])),
+                        "brake": _number(channels.get(CAR_CHANNELS["brake"])),
+                        "drs": _number(channels.get(CAR_CHANNELS["drs"])),
+                    }
+                )
 
     def _on_Position(self, payload: dict[str, Any]) -> None:
-        for key, row in (payload.get("Entries") or {}).items():
+        """``Position.z``: where the car is, in the feed's own coordinates.
+
+        The live shape is ``{"Position": [{"Timestamp": ..., "Entries":
+        {<drv>: {"Status": "OnTrack", "X": ..., "Y": ..., "Z": ...}}}]}``.
+        """
+        samples = payload.get("Position")
+        if isinstance(samples, list):
+            for sample in samples:
+                self._store_positions((sample or {}).get("Entries") or {})
+        entries = payload.get("Entries")
+        if isinstance(entries, dict):
+            self._store_positions(entries)
+
+    def _store_positions(self, entries: dict[str, Any]) -> None:
+        for key, row in entries.items():
             try:
-                number = int(row.get("Number", key))
-                self.state.order[number] = int(row.get("Position"))
+                number = int(row.get("Number") or key)
             except (TypeError, ValueError):
                 continue
+            car = self.state.cars.setdefault(number, {"driver_number": number})
+            x, y = _number(row.get("X")), _number(row.get("Y"))
+            car["x"] = x
+            car["y"] = y
+            car["z"] = _number(row.get("Z"))
+            if "Status" in row:
+                status = row.get("Status")
+                car["status"] = status
+                car["on_track"] = str(status).strip().lower() == "ontrack"
+            # A car in its garage is reported off-track; those samples would
+            # stretch the map over the pit lane, so only running cars build
+            # the outline.
+            in_garage = car.get("status") is not None and car.get("on_track") is False
+            usable = x is not None and y is not None and not in_garage
+            if usable:
+                history = self._tracks.setdefault(number, [])
+                history.append((time.time(), x, y))
+                if len(history) > 4000:
+                    del history[:-3000]
+                if self._extent is None:
+                    self._extent = [x, x, y, y]
+                else:
+                    self._extent[0] = min(self._extent[0], x)
+                    self._extent[1] = max(self._extent[1], x)
+                    self._extent[2] = min(self._extent[2], y)
+                    self._extent[3] = max(self._extent[3], y)
+                self._position_count += 1
 
     def _on_TimingData(self, payload: dict[str, Any]) -> None:
         for key, row in (payload.get("Lines") or {}).items():
             try:
-                number = int(row.get("Number", key))
+                number = int(key)
             except (TypeError, ValueError):
                 continue
             entry = self.state.timing.setdefault(number, {})
             entry.update(
                 {
                     "driver_number": number,
-                    "number_of_laps": row.get("NumberOfLaps"),
-                    "position": row.get("Position"),
-                    "retired": row.get("Retired"),
-                    "stopped": row.get("Stopped"),
-                    "status": row.get("Status"),
-                    "last_lap": (row.get("LastLap") or {}).get("Value"),
-                    "best_lap": (row.get("BestLap") or {}).get("Value"),
-                    "interval_to_ahead": (row.get("IntervalToAhead") or {}).get("Value"),
-                    "interval_to_leader": (row.get("IntervalToLeader") or {}).get("Value"),
-                    "pit_stop": (row.get("PitStop") or {}).get("PitStop"),
+                    "number_of_laps": row.get("NumberOfLaps", entry.get("number_of_laps")),
+                    "position": row.get("Position", entry.get("position")),
+                    "retired": row.get("Retired", entry.get("retired")),
+                    "stopped": row.get("Stopped", entry.get("stopped")),
+                    "status": row.get("Status", entry.get("status")),
+                    "last_lap": (row.get("LastLap") or {}).get(
+                        "Value", entry.get("last_lap")
+                    ),
+                    "best_lap": (row.get("BestLap") or {}).get(
+                        "Value", entry.get("best_lap")
+                    ),
+                    "interval_to_ahead": (row.get("IntervalToAhead") or {}).get(
+                        "Value", entry.get("interval_to_ahead")
+                    ),
+                    "interval_to_leader": (row.get("IntervalToLeader") or {}).get(
+                        "Value", entry.get("interval_to_leader")
+                    ),
+                    "pit_stop": (row.get("PitStop") or {}).get(
+                        "PitStop", entry.get("pit_stop")
+                    ),
                 }
             )
+            position = entry.get("position")
+            try:
+                if position is not None:
+                    self.state.order[number] = int(position)
+            except (TypeError, ValueError):
+                pass
+
+    def _on_TimingAppData(self, payload: dict[str, Any]) -> None:
+        """``TimingAppData`` carries the tyres, which ``TimingData`` does not.
+
+        The shape is ``{"Lines": {<drv>: {"Stints": {<n>: {"Compound":
+        "SOFT", "TotalLaps": 7, "StartLaps": 0}}}}}``.
+        """
+        for key, row in (payload.get("Lines") or {}).items():
+            try:
+                number = int(key)
+            except (TypeError, ValueError):
+                continue
+            stints = row.get("Stints")
+            if not isinstance(stints, dict) or not stints:
+                continue
+
+            def _order(item: tuple[str, Any]) -> float:
+                try:
+                    return float(item[0])
+                except (TypeError, ValueError):
+                    return -1.0
+
+            latest = max(stints.items(), key=_order)[1] or {}
+            entry = self.state.tyres.setdefault(number, {})
+            if latest.get("Compound"):
+                entry["compound"] = latest["Compound"]
+            for field_name, key_name in (
+                ("total_laps", "TotalLaps"),
+                ("start_laps", "StartLaps"),
+            ):
+                if latest.get(key_name) is not None:
+                    entry[field_name] = latest[key_name]
+            entry["new"] = latest.get("New")
 
     def _on_WeatherData(self, payload: dict[str, Any]) -> None:
-        for key, row in (payload.get("Reports") or {}).items():
+        reports = payload.get("Reports")
+        if isinstance(reports, dict):
+            rows = list(reports.values())
+        elif isinstance(reports, list):
+            rows = reports
+        else:
+            rows = [payload]
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
             self.state.weather.append(
                 {
-                    "date": row.get("TimeStamp"),
+                    "date": row.get("Utc") or row.get("TimeStamp"),
                     "session_key": row.get("SessionKey"),
                     "air_temperature": row.get("AirTemp"),
                     "track_temperature": row.get("TrackTemp"),
@@ -409,35 +753,89 @@ class LivetimingLiveSource:
                     "track_status": row.get("TrackStatus"),
                 }
             )
-            self.state.weather.sort(key=lambda r: str(r.get("date") or ""))
+        self.state.weather.sort(key=lambda r: str(r.get("date") or ""))
+        del self.state.weather[:-600]
 
     def _on_TeamRadio(self, payload: dict[str, Any]) -> None:
-        """F1 sends the radio **as text** - no transcription needed."""
-        for key, row in (payload.get("Captions") or {}).items():
-            captions = row.get("Captions") or ""
-            if not captions:
+        """F1 sends the radio **as text** - no transcription needed.
+
+        The caption is normally ``{"Utc": ..., "Captions": "1: ..."}`` under a
+        ``"<driver>-<utc>"`` key, but the recording's metadata has also been
+        seen as a JSON string inside the caption.  Both are accepted: the
+        words are what matter, and a call that cannot be attributed is still
+        shown rather than dropped.
+        """
+        captions = payload.get("Captions")
+        if isinstance(captions, list):
+            items = {str(i): row for i, row in enumerate(captions)}
+        elif isinstance(captions, dict):
+            items = captions
+        else:
+            return
+        known = {(str(r.get("date") or ""), str(r.get("text") or "")) for r in self.state.radio}
+        for key, row in items.items():
+            if isinstance(row, str):
+                # Either the words themselves or the recording metadata.
+                try:
+                    parsed = json.loads(row)
+                except ValueError:
+                    parsed = {"Captions": row}
+                row = parsed if isinstance(parsed, dict) else {"Captions": row}
+            if not isinstance(row, dict):
                 continue
-            stamp, _, text = captions.partition(": ")
-            driver_number = None
+            text = row.get("Captions") or row.get("Text") or ""
+            if isinstance(text, str) and text.lstrip().startswith("{"):
+                # The caption is the recording's metadata, with the words inside.
+                try:
+                    inner = json.loads(text)
+                except ValueError:
+                    inner = None
+                if isinstance(inner, dict):
+                    row = {**row, **inner}
+                    text = row.get("Captions") or row.get("Text") or ""
+            if not isinstance(text, str) or not text.strip():
+                continue
+            number = row.get("RacingNumber") or row.get("DriverNumber")
             try:
-                driver_number = int(str(key).split("-")[0])
+                driver_number = int(str(number)) if number is not None else None
             except (TypeError, ValueError):
                 driver_number = None
+            if driver_number is None:
+                try:
+                    driver_number = int(str(key).split("-")[0])
+                except (TypeError, ValueError):
+                    driver_number = None
+            stamp = str(row.get("Utc") or key)
+            who, _, spoken = text.partition(": ")
+            spoken = spoken or text
+            if (stamp, spoken) in known:
+                continue
+            known.add((stamp, spoken))
             self.state.radio.append(
                 {
-                    "date": row.get("TimeStamp") or str(key).split("-", 1)[-1],
+                    "date": stamp,
                     "driver_number": driver_number,
-                    "who": stamp,
-                    "text": text or captions,
+                    "who": who if spoken != text else None,
+                    "text": spoken,
                 }
             )
-            self.state.radio.sort(key=lambda r: str(r.get("date") or ""))
+        self.state.radio.sort(key=lambda r: str(r.get("date") or ""))
+        del self.state.radio[:-400]
 
     def _on_RaceControlMessages(self, payload: dict[str, Any]) -> None:
-        for key, row in (payload.get("Messages") or {}).items():
+        messages = payload.get("Messages")
+        if isinstance(messages, list):
+            items = {str(i): row for i, row in enumerate(messages)}
+        elif isinstance(messages, dict):
+            items = messages
+        else:
+            return
+        for key, row in items.items():
+            if not isinstance(row, dict):
+                continue
             self.state.messages.append(
                 {
-                    "date": row.get("TimeStamp"),
+                    "date": row.get("Utc") or row.get("TimeStamp") or key,
                     "message": row.get("Message"),
                     "category": row.get("Category"),
                     "flag": row.get("Flag"),
@@ -447,7 +845,37 @@ class LivetimingLiveSource:
                     "status": row.get("Status"),
                 }
             )
-            self.state.messages.sort(key=lambda r: str(r.get("date") or ""))
+        self.state.messages.sort(key=lambda r: str(r.get("date") or ""))
+        del self.state.messages[:-200]
+
+    # ------------------------------------------------------------------
+    # geometry
+    # ------------------------------------------------------------------
+    def bounds(self) -> tuple[float, float, float, float] | None:
+        """The extent of every position seen so far, in the feed's own frame."""
+        if self._extent is None or self._position_count < 3:
+            return None
+        return self._extent[0], self._extent[1], self._extent[2], self._extent[3]
+
+    def trace(self, seconds: float = 150.0) -> list[tuple[float, float]]:
+        """One car's driven path, newest last, as a stand-in track outline.
+
+        F1's live feed gives positions in its **own** two-dimensional frame,
+        not in GPS coordinates, so there is no published way to map them onto
+        a GPS circuit outline.  The honest outline is therefore the path the
+        cars themselves have driven: a real lap, traced by a real car, with
+        nothing invented.
+
+        The driver with the most recent samples is used, so the trace follows
+        whoever is circulating most steadily rather than a car in the pits.
+        """
+        cutoff = time.time() - seconds
+        best: list[tuple[float, float]] = []
+        for samples in self._tracks.values():
+            recent = [(t, x, y) for (t, x, y) in samples if t >= cutoff]
+            if len(recent) > len(best):
+                best = [(x, y) for (_, x, y) in recent]
+        return best
 
     # ------------------------------------------------------------------
     # the snapshot the pit wall consumes
@@ -460,26 +888,28 @@ class LivetimingLiveSource:
         order: list[dict[str, Any]] = []
 
         for number, car in sorted(self.state.cars.items()):
-            positions.append(
-                {
-                    "driver_number": number,
-                    "x": car.get("x"),
-                    "y": car.get("y"),
-                    "z": car.get("z"),
-                    "date": datetime.now(UTC).isoformat(),
-                }
-            )
-            telemetry.append(
-                {
-                    "driver_number": number,
-                    "speed": car.get("speed"),
-                    "throttle": car.get("throttle"),
-                    "brake": car.get("brake"),
-                    "n_gear": car.get("n_gear"),
-                    "rpm": car.get("rpm"),
-                    "drs": car.get("drs"),
-                }
-            )
+            if car.get("x") is not None and car.get("y") is not None:
+                positions.append(
+                    {
+                        "driver_number": number,
+                        "x": car.get("x"),
+                        "y": car.get("y"),
+                        "z": car.get("z"),
+                        "date": datetime.now(UTC).isoformat(),
+                    }
+                )
+            if car.get("speed") is not None:
+                telemetry.append(
+                    {
+                        "driver_number": number,
+                        "speed": car.get("speed"),
+                        "throttle": car.get("throttle"),
+                        "brake": car.get("brake"),
+                        "n_gear": car.get("n_gear"),
+                        "rpm": car.get("rpm"),
+                        "drs": car.get("drs"),
+                    }
+                )
 
         for number, timing in sorted(self.state.timing.items()):
             intervals.append(
@@ -536,21 +966,62 @@ class LivetimingLiveAdapter:
 
     @property
     def circuit(self) -> str:
+        """The circuit, as the calendar names it (``Austin``, ``Monza``...)."""
         meeting = self.source.state.session.get("Meeting") or {}
+        circuit = meeting.get("Circuit") or {}
         return str(
-            meeting.get("OfficialName")
+            circuit.get("ShortName")
+            or meeting.get("CircuitShortName")
             or meeting.get("Name")
             or self.source.state.session.get("Name")
             or "Live"
         )
 
     @property
+    def session_name(self) -> str | None:
+        name = self.source.state.session.get("Name")
+        return str(name) if name else None
+
+    @property
+    def session_type(self) -> str | None:
+        value = self.source.state.session.get("Type")
+        return str(value) if value else None
+
+    @property
+    def total_laps(self) -> int | None:
+        value = self.source.state.lap_count.get("TotalLaps")
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @property
+    def meta(self) -> dict[str, Any]:
+        """Session metadata, in the shape the replay's pack uses."""
+        session = self.source.state.session
+        status = session.get("SessionStatus") or {}
+        return {
+            "session_name": self.session_name,
+            "session_type": self.session_type,
+            "date_start": session.get("StartDate"),
+            "date_end": session.get("EndDate"),
+            "status": status.get("Status") if isinstance(status, dict) else None,
+        }
+
+    @property
     def year(self) -> int:
         meeting = self.source.state.session.get("Meeting") or {}
-        try:
-            return int(meeting.get("Year") or 0)
-        except (TypeError, ValueError):
-            return 0
+        for value in (meeting.get("Year"), self.source.state.session.get("StartDate")):
+            try:
+                if value is None:
+                    continue
+                text = str(value)
+                if len(text) >= 4 and text[:4].isdigit():
+                    return int(text[:4])
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return 0
 
     async def refresh(self) -> bool:
         """Make sure the hub is connected and hand over the latest state."""
@@ -591,9 +1062,16 @@ class LivetimingLiveAdapter:
 
         state = self.source.state
         drivers: list[DriverFrame] = []
-        for number, car in sorted(state.cars.items()):
+        # Everyone the feed has named, not just the cars that have sent a
+        # position yet: at the start of a session the driver list arrives
+        # before the first telemetry, and the tower should not be empty.
+        numbers = sorted(set(state.cars) | set(state.timing) | set(state.drivers))
+        for number in numbers:
+            car = state.cars.get(number, {})
             meta = state.drivers.get(number, {})
             timing = state.timing.get(number, {})
+            tyre = state.tyres.get(number, {})
+            tyres_total = tyre.get("total_laps")
             drivers.append(
                 DriverFrame(
                     driver_number=number,
@@ -601,7 +1079,7 @@ class LivetimingLiveAdapter:
                     name=str(meta.get("name") or ""),
                     team=str(meta.get("team") or ""),
                     team_colour=_colour(meta.get("team_colour")),
-                    position=state.order.get(number) or car.get("position"),
+                    position=state.order.get(number) or timing.get("position"),
                     x=car.get("x"),
                     y=car.get("y"),
                     z=car.get("z"),
@@ -611,29 +1089,55 @@ class LivetimingLiveAdapter:
                     gear=car.get("n_gear"),
                     rpm=car.get("rpm"),
                     drs=car.get("drs"),
-                    drs_open=bool(car.get("drs") and int(car["drs"]) > 9),
+                    drs_open=bool(car.get("drs") and float(car["drs"]) > 9),
                     gap_to_leader=timing.get("interval_to_leader"),
                     interval=timing.get("interval_to_ahead"),
-                    compound=car.get("compound"),
-                    tyre_age=car.get("tyre_age"),
-                    lap=car.get("lap"),
+                    compound=tyre.get("compound"),
+                    tyre_age=tyres_total,
+                    lap=timing.get("number_of_laps"),
                     last_lap_s=timing.get("last_lap"),
-                    on_track=car.get("x") is not None,
+                    on_track=bool(car.get("on_track", car.get("x") is not None)),
                 )
             )
 
         drivers.sort(key=lambda d: (d.position if d.position else 999, d.code))
+        lap = state.lap_count.get("CurrentLap")
+        if lap is None:
+            lap = max((d.lap or 0 for d in drivers), default=0) or None
+        try:
+            lap = int(lap) if lap is not None else None
+        except (TypeError, ValueError):
+            lap = None
         return RaceFrame(
             session_key=self.session_key,
             circuit=self.circuit,
             year=self.year,
             timestamp=datetime.now(UTC),
-            elapsed_s=0.0,
+            elapsed_s=self._elapsed_s(),
             flag_state=self._flag_state(),
             drivers=drivers,
             source="livetiming.live",
             replay_speed=replay_speed,
+            lap=lap,
+            total_laps=self.total_laps,
+            metadata=self.meta,
         )
+
+    def _elapsed_s(self) -> float:
+        """How long the session has been running, from the hub's own clock."""
+        session = self.source.state.session
+        status = session.get("SessionStatus") or {}
+        start = status.get("Started") if isinstance(status, dict) else None
+        start = start or session.get("StartDate")
+        if not start:
+            return 0.0
+        try:
+            started = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        except ValueError:
+            return 0.0
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=UTC)
+        return max(0.0, (datetime.now(UTC) - started).total_seconds())
 
     def recent_messages(self, limit: int = 8) -> list[dict[str, Any]]:
         """The most recent race-control messages."""
