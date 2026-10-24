@@ -305,8 +305,17 @@ class PitWallState:
         # working on it; a failed fit only costs the strategy panel.
         try:
             bundle = fit_calibration(session_key, SESSION_DIR)
-            save_calibration(bundle)
-            logger.info("calibrated %s %s", bundle.circuit, bundle.year)
+            # Only write when the numbers actually changed: the committed
+            # bundle would otherwise be rewritten (different key order) on
+            # every start, which shows up as noise in every diff.
+            current = None
+            try:
+                current = load_calibration(bundle.circuit, bundle.year)
+            except FileNotFoundError:
+                current = None
+            if current is None or current.model_dump() != bundle.model_dump():
+                save_calibration(bundle)
+                logger.info("calibrated %s %s", bundle.circuit, bundle.year)
         except Exception as exc:  # noqa: BLE001
             logger.warning("calibration for session %s failed: %s", session_key, exc)
         return await self._load_replay(session_key)
