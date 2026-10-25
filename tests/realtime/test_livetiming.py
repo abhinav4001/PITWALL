@@ -148,6 +148,14 @@ def test_a_finished_session_is_not_live() -> None:
     assert session_is_running(finished, now=datetime(2026, 10, 24, 14, 0, tzinfo=UTC)) is False
     assert session_is_running({}, now=datetime(2026, 10, 24, 14, 0, tzinfo=UTC)) is False
 
+    # The hub uses "Finished" for the post-session state.  It must win over
+    # the published window, which still allows a 45-minute overrun.
+    just_finished = dict(finished, SessionStatus={"Status": "Finished"})
+    assert (
+        session_is_running(just_finished, now=datetime(2026, 10, 23, 17, 15, tzinfo=UTC))
+        is False
+    )
+
     running = dict(finished, SessionStatus={"Status": "Started"})
     assert session_is_running(running, now=datetime(2026, 10, 23, 16, 30, tzinfo=UTC)) is True
 
@@ -440,6 +448,46 @@ def test_the_hubs_string_times_are_normalised() -> None:
     assert frame.drivers[0].last_lap_s == 99.699
 
 
+def test_race_timing_uses_gap_to_leader_and_interval_to_position_ahead() -> None:
+    """The race feed names the gaps differently from practice.
+
+    Measured on 2026-10-25 during the United States Grand Prix: the hub sent
+    ``GapToLeader`` and ``IntervalToPositionAhead`` rather than
+    ``TimeDiffToFastest`` / ``TimeDiffToPositionAhead``.  Without both shapes
+    the timing tower showed a dash for every car even though the feed had
+    the real gaps.
+    """
+    source = LivetimingLiveSource()
+    source._handle(
+        _frame(
+            "TimingData",
+            {
+                "Lines": {
+                    "16": {
+                        "Position": "3",
+                        "NumberOfLaps": 2,
+                        "GapToLeader": "+3.576",
+                        "IntervalToPositionAhead": {"Value": "+1.305"},
+                        "LastLapTime": {"Value": "1:48.941"},
+                        "BestLapTime": {"Value": "1:48.941", "Lap": 2},
+                    }
+                }
+            },
+        )
+    )
+    timing = source.state.timing[16]
+    assert timing["interval_to_leader"] == 3.576
+    assert timing["interval_to_ahead"] == 1.305
+    assert timing["last_lap"] == 108.941
+    assert timing["best_lap"] == 108.941
+
+    driver = LivetimingLiveAdapter(source).frame().drivers[0]
+    assert driver.gap_to_leader == 3.576
+    assert driver.interval == 1.305
+    assert driver.last_lap_s == 108.941
+    assert driver.best_lap_s == 108.941
+
+
 def test_the_tyres_come_from_timing_app_data() -> None:
     """``TimingData`` has no compound; ``TimingAppData`` does."""
     source = LivetimingLiveSource()
@@ -583,6 +631,67 @@ def test_the_adapter_builds_a_frame_like_the_replay_does() -> None:
     assert driver.lap == 12
     assert driver.on_track is True
     assert frame.source == "livetiming.live"
+
+
+def test_a_used_tyre_age_is_the_total_laps_on_that_set() -> None:
+    adapter = LivetimingLiveAdapter(LivetimingLiveSource())
+    source = adapter.source
+    source._handle(
+        _frame(
+            "DriverList",
+            {
+                "1": {
+                    "RacingNumber": "1",
+                    "Tla": "VER",
+                    "FullName": "Max VERSTAPPEN",
+                    "TeamName": "Red Bull Racing",
+                }
+            },
+        )
+    )
+    source._handle(
+        _frame(
+            "TimingData",
+            {
+                "Lines": {
+                    "1": {
+                        "Position": "1",
+                        "NumberOfLaps": 12,
+                        "LastLapTime": {"Value": "2:44.069"},
+                        "BestLapTime": {"Value": "1:35.127"},
+                        "Speeds": {"ST": {"Value": "298"}},
+                    }
+                }
+            },
+        )
+    )
+    source._handle(
+        _frame(
+            "TimingAppData",
+            {
+                "Lines": {
+                    "1": {
+                        "Stints": [
+                            {
+                                "Compound": "SOFT",
+                                "New": "false",
+                                "TotalLaps": 4,
+                                "StartLaps": 3,
+                            }
+                        ]
+                    }
+                }
+            },
+        )
+    )
+
+    driver = adapter.frame().drivers[0]
+    # TotalLaps is the age of the set, including the laps it had already run
+    # when it was fitted.  StartLaps is not added again.
+    assert driver.tyre_age == 4
+    assert driver.best_lap_s == pytest.approx(95.127)
+    assert driver.last_lap_s == pytest.approx(164.069)
+    assert driver.speed_trap == pytest.approx(298)
 
 
 def test_a_broken_frame_does_not_break_the_stream() -> None:

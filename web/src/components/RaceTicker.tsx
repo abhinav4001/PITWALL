@@ -108,7 +108,7 @@ export function RaceTicker({
                 <span className="text-zinc-300 light:text-zinc-700 text-xs font-bold tabular-nums">
                   {driver.position === 1
                     ? 'LEADER'
-                    : gapAhead === null
+                    : gapAhead === null || gapAhead < 0
                       ? '—'
                       : `+${gapAhead.toFixed(3)}`}
                 </span>

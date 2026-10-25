@@ -82,6 +82,14 @@ export function TimingTower({ drivers, selectedDriver, onSelect }: TimingTowerPr
             : driver.gap_to_leader !== null && driver.gap_to_leader !== undefined
               ? driver.gap_to_leader - (leader?.gap_to_leader ?? 0)
               : null
+        // ``last_lap_s`` can legitimately be a pit-in or out-lap and then
+        // looks nothing like a flying lap.  Show the fastest lap when the
+        // feed gives it, and label which one is on screen.
+        const lapTime = driver.best_lap_s ?? driver.last_lap_s
+        const lapLabel =
+          driver.best_lap_s !== null && driver.best_lap_s !== undefined
+            ? 'BEST'
+            : 'LAST'
         return (
           <div
             key={driver.driver_number}
@@ -141,7 +149,7 @@ export function TimingTower({ drivers, selectedDriver, onSelect }: TimingTowerPr
               >
                 {driver.position === 1
                   ? 'LEADER'
-                  : gapAhead === null
+                  : gapAhead === null || gapAhead < 0
                     ? '—'
                     : `+${gapAhead.toFixed(3)}`}
               </span>
@@ -161,9 +169,19 @@ export function TimingTower({ drivers, selectedDriver, onSelect }: TimingTowerPr
                 {driver.tyre_age ?? '—'} L)
               </span>
 
-              {driver.last_lap_s && (
-                <span className="text-zinc-500 font-bold text-xs">
-                  {formatLapTime(driver.last_lap_s)}
+              {lapTime !== null && lapTime !== undefined && (
+                <span
+                  className="text-zinc-500 font-bold text-xs"
+                  title={
+                    lapLabel === 'BEST'
+                      ? 'Fastest lap so far'
+                      : 'Last completed lap'
+                  }
+                >
+                  <span className="text-[9px] tracking-widest text-zinc-600 mr-1">
+                    {lapLabel}
+                  </span>
+                  {formatLapTime(lapTime)}
                 </span>
               )}
             </div>

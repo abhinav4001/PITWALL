@@ -27,3 +27,6 @@ livef1.log
 # Local backend logs
 backend.log
 backend.err.log
+
+# Local frontend logs
+web/*.log

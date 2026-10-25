@@ -222,6 +222,13 @@ class DriverFrame:
     tyre_age: int | None = None
     lap: int | None = None
     last_lap_s: float | None = None
+    #: The driver's fastest completed lap so far.  F1's live timing sends
+    #: this separately from ``LastLapTime``, which can include a pit stop or
+    #: an out-lap and therefore looks implausibly slow next to a flying lap.
+    best_lap_s: float | None = None
+    #: Speed at the feed's speed trap, in km/h.  This is real data that the
+    #: timing feed publishes even when continuous ``CarData`` is unavailable.
+    speed_trap: float | None = None
     on_track: bool = False
     #: Whether the timing feed is still reporting for this driver.  Some
     #: drivers stop reporting part way through a session - in the 2024
@@ -253,6 +260,8 @@ class DriverFrame:
             "tyre_age": self.tyre_age,
             "lap": self.lap,
             "last_lap_s": self.last_lap_s,
+            "best_lap_s": self.best_lap_s,
+            "speed_trap": self.speed_trap,
             "on_track": self.on_track,
             "reporting": self.reporting,
         }

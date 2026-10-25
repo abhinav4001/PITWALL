@@ -68,6 +68,8 @@ export interface DriverPosition {
   tyre_age: number | null
   lap: number | null
   last_lap_s: number | null
+  best_lap_s: number | null
+  speed_trap: number | null
   on_track: boolean
   /** Whether the timing feed is still reporting for this driver. */
   reporting: boolean

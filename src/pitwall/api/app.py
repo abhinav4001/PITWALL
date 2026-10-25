@@ -891,10 +891,19 @@ async def circuit_outline(circuit_name: str, year: int | None = None) -> dict[st
     target_year = year or (state.year if circuit == state.circuit else 2024)
 
     outline = load_outline(OUTLINE_DIR, circuit, target_year)
+    outline_year = target_year
     if outline is None and state.client is not None:
         circuit_key = await _circuit_key(circuit, target_year)
         if circuit_key is not None:
             outline = resolve_outline(OUTLINE_DIR, circuit, target_year, circuit_key=circuit_key)
+    if outline is None and target_year != 2024:
+        # The circuit layout is stable between seasons; if this season's
+        # outline has not been built, the cached 2024 GPS outline is still a
+        # real outline of the same circuit.  Label the year so the response
+        # does not pretend it came from the requested season.
+        outline = load_outline(OUTLINE_DIR, circuit, 2024)
+        if outline is not None:
+            outline_year = 2024
     if outline is None:
         return _unavailable("outline_not_built", circuit=circuit, year=target_year)
     projection = TrackProjection.from_outline(outline.points)
@@ -907,7 +916,8 @@ async def circuit_outline(circuit_name: str, year: int | None = None) -> dict[st
         "available": True,
         "source": outline.source,
         "circuit": circuit,
-        "year": target_year,
+        "year": outline_year,
+        "session_year": target_year if outline_year != target_year else None,
         "points": projected,
         "raw_points": data["points"],
         "corners": [
@@ -1042,14 +1052,22 @@ async def championship_scenarios() -> dict[str, Any]:
 
 @app.get("/api/drivers")
 async def drivers(session_key: int | None = None) -> dict[str, Any]:
-    """The driver list of the session being followed."""
+    """The driver list of the session being followed.
+
+    The live adapter exposes drivers through its frame, while the replay
+    replayer also has a plain ``drivers`` mapping.  Going through the frame
+    keeps this endpoint working in both modes instead of raising
+    ``AttributeError`` on the live adapter.
+    """
     if state.replayer is None:
         return _unavailable("no_replay_session_cached")
+    async with state.lock:
+        frame = state.replayer.frame(replay_speed=state.replay_speed)
     return {
         "available": True,
         "source": _source_name(),
-        "session_key": state.replayer.session_key,
-        "drivers": state.replayer.drivers,
+        "session_key": frame.session_key,
+        "drivers": [driver.to_dict() for driver in frame.drivers],
     }
 
 
@@ -1071,6 +1089,10 @@ async def positions(
         payload = project_frame(frame, state.projection)
         if state.loop is not None:
             state.loop.add_lookahead(payload)
+    positions_available = any(
+        row.get("x") is not None and row.get("y") is not None
+        for row in payload["drivers"]
+    )
     return {
         "available": True,
         "source": _source_name(),
@@ -1081,6 +1103,11 @@ async def positions(
         "lap": payload["lap"],
         "total_laps": payload["total_laps"],
         "drivers": payload["drivers"],
+        # The endpoint still carries the timing rows when the feed has no
+        # positions, but callers can tell the difference instead of treating
+        # null coordinates as a real place on the circuit.
+        "positions_available": positions_available,
+        "reason": None if positions_available else "feed_has_no_positions",
     }
 
 
@@ -1103,12 +1130,26 @@ async def telemetry(
             return _unavailable(
                 "driver_not_in_session", driver_number=driver_number
             )
+    telemetry_available = any(
+        value is not None
+        for driver in selected
+        for value in (
+            driver.speed,
+            driver.throttle,
+            driver.brake,
+            driver.gear,
+            driver.rpm,
+            driver.drs,
+        )
+    )
     return {
         "available": True,
         "source": _source_name(),
         "timestamp": frame.timestamp.isoformat(),
         "elapsed_s": round(frame.elapsed_s, 3),
         "telemetry": [d.to_dict() for d in selected],
+        "telemetry_available": telemetry_available,
+        "reason": None if telemetry_available else "feed_has_no_car_data",
     }
 
 
@@ -1170,7 +1211,7 @@ async def replay_control(
         clock = getattr(state.replayer, "clock", None)
     return {
         "available": True,
-        "source": "openf1",
+        "source": _source_name(),
         "action": action,
         "speed": state.replay_speed,
         "elapsed_s": round(float(getattr(clock, "elapsed_s", 0.0) or 0.0), 3),
@@ -1452,12 +1493,20 @@ async def live_snapshot() -> dict[str, Any]:
     request per driver, which is what keeps the free tier from rate-limiting
     us (see :mod:`pitwall.realtime.live`).
     """
-    if state.client is None:
-        return _unavailable("openf1_unavailable")
-    source = OpenF1LiveSource(state.client, DEFAULT_REPLAY_SESSION)
-    snapshot = await source.poll()
+    if state.mode == "LIVE" and state.livetiming is not None:
+        snapshot = state.livetiming.source.snapshot()
+        source_name = "livetiming.hub"
+    else:
+        if state.client is None:
+            return _unavailable("openf1_unavailable")
+        source = OpenF1LiveSource(state.client, DEFAULT_REPLAY_SESSION)
+        snapshot = await source.poll()
+        source_name = "openf1"
     if not snapshot.positions and not snapshot.telemetry:
-        return _unavailable("no_live_data")
+        return _unavailable(
+            "feed_has_no_positions" if source_name == "livetiming.hub" else "no_live_data",
+            source=source_name,
+        )
     positions_by_driver = latest_per_driver(snapshot.positions)
     telemetry_by_driver = latest_per_driver(snapshot.telemetry)
     drivers_out = []
@@ -1480,9 +1529,9 @@ async def live_snapshot() -> dict[str, Any]:
         )
     return {
         "available": True,
-        "source": "openf1",
+        "source": source_name,
         "timestamp": snapshot.timestamp.isoformat(),
-        "requests_per_tick": 2,
+        "requests_per_tick": 0 if source_name == "livetiming.hub" else 2,
         "drivers": drivers_out,
     }
 

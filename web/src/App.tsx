@@ -1005,6 +1005,11 @@ export default function PitWallApp() {
                     {[
                       ['SPEED', selected.speed !== null ? `${selected.speed} km/h` : '—', 'text-white'],
                       [
+                        'SPEED TRAP',
+                        selected.speed_trap !== null ? `${selected.speed_trap} km/h` : '—',
+                        'text-cyan-300',
+                      ],
+                      [
                         'GEAR / RPM',
                         `Gear ${selected.gear ?? '—'} (${selected.rpm ?? '—'} RPM)`,
                         'text-amber-400',
@@ -1033,8 +1038,9 @@ export default function PitWallApp() {
 
                     {session?.mode === 'LIVE' && selected.speed === null && (
                       <p className="text-[11px] leading-relaxed text-zinc-500 light:text-zinc-500">
-                        F1&apos;s free feed is not publishing car telemetry for
-                        this session.
+                        F1&apos;s free feed is not publishing continuous car
+                        telemetry for this session. The speed trap comes from
+                        the timing feed.
                       </p>
                     )}
 

@@ -240,7 +240,9 @@ def _radio_url(path: Any, session_path: Any = None) -> str | None:
 
 
 #: Session statuses that mean the session is no longer running.
-ENDED_STATUSES = frozenset({"finalised", "finalized", "ended", "aborted", "cancelled"})
+ENDED_STATUSES = frozenset(
+    {"finalised", "finalized", "finished", "ended", "aborted", "cancelled"}
+)
 
 #: Session statuses that mean the session is running now.
 RUNNING_STATUSES = frozenset({"started", "inprogress", "in progress"})
@@ -820,24 +822,41 @@ class LivetimingLiveSource:
                             "Value", entry.get("best_lap")
                         )
                     ),
+                    # Practice uses TimeDiffToFastest /
+                    # TimeDiffToPositionAhead; the race uses GapToLeader and
+                    # IntervalToPositionAhead.  Both are the same real gap.
                     "interval_to_ahead": _seconds(
                         row.get(
                             "TimeDiffToPositionAhead",
-                            (row.get("IntervalToAhead") or {}).get(
-                                "Value", entry.get("interval_to_ahead")
+                            (row.get("IntervalToPositionAhead") or {}).get(
+                                "Value",
+                                (row.get("IntervalToAhead") or {}).get(
+                                    "Value", entry.get("interval_to_ahead")
+                                ),
                             ),
                         )
                     ),
                     "interval_to_leader": _seconds(
                         row.get(
                             "TimeDiffToFastest",
-                            (row.get("IntervalToLeader") or {}).get(
-                                "Value", entry.get("interval_to_leader")
+                            row.get(
+                                "GapToLeader",
+                                (row.get("IntervalToLeader") or {}).get(
+                                    "Value", entry.get("interval_to_leader")
+                                ),
                             ),
                         )
                     ),
                     "pit_stop": (row.get("PitStop") or {}).get(
                         "PitStop", entry.get("pit_stop")
+                    ),
+                    # ``Speeds`` is part of TimingData and is published even
+                    # when the separate CarData stream is not.  The ``ST``
+                    # channel is the speed trap, in km/h.
+                    "speed_trap": _number(
+                        ((row.get("Speeds") or {}).get("ST") or {}).get(
+                            "Value", entry.get("speed_trap")
+                        )
                     ),
                 }
             )
@@ -1284,6 +1303,11 @@ class LivetimingLiveAdapter:
             timing = state.timing.get(number, {})
             tyre = state.tyres.get(number, {})
             tyres_total = tyre.get("total_laps")
+            # ``TotalLaps`` is the total number of laps driven on this set of
+            # tyres, including laps from earlier sessions.  That is the age
+            # shown on the car.  ``StartLaps`` is the age when the set was
+            # fitted, so adding it would double-count the laps already run.
+            tyre_age = _int(tyres_total) if tyres_total is not None else None
             position = _int(state.order.get(number) or timing.get("position"))
             drivers.append(
                 DriverFrame(
@@ -1306,9 +1330,11 @@ class LivetimingLiveAdapter:
                     gap_to_leader=timing.get("interval_to_leader"),
                     interval=timing.get("interval_to_ahead"),
                     compound=tyre.get("compound"),
-                    tyre_age=tyres_total,
+                    tyre_age=tyre_age,
                     lap=timing.get("number_of_laps"),
                     last_lap_s=timing.get("last_lap"),
+                    best_lap_s=timing.get("best_lap"),
+                    speed_trap=timing.get("speed_trap"),
                     on_track=bool(car.get("on_track", car.get("x") is not None)),
                 )
             )
