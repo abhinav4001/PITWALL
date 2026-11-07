@@ -30,3 +30,5 @@ backend.err.log
 
 # Local frontend logs
 web/*.log
+/web.log
+/web.err.log

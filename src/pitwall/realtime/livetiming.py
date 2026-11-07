@@ -240,8 +240,12 @@ def _radio_url(path: Any, session_path: Any = None) -> str | None:
 
 
 #: Session statuses that mean the session is no longer running.
+#:
+#: "Aborted" is deliberately absent.  F1 uses it while a session is stopped
+#: (for example during a red flag) and can resume the same session; the
+#: published start/end window below decides whether it is still current.
 ENDED_STATUSES = frozenset(
-    {"finalised", "finalized", "finished", "ended", "aborted", "cancelled"}
+    {"finalised", "finalized", "finished", "ended", "cancelled"}
 )
 
 #: Session statuses that mean the session is running now.

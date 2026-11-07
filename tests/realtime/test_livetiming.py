@@ -159,6 +159,13 @@ def test_a_finished_session_is_not_live() -> None:
     running = dict(finished, SessionStatus={"Status": "Started"})
     assert session_is_running(running, now=datetime(2026, 10, 23, 16, 30, tzinfo=UTC)) is True
 
+    # "Aborted" means the session was stopped, typically for a red flag.  F1
+    # can resume it, and the timing feed keeps updating, so the published
+    # window decides whether it is still current.
+    aborted = dict(finished, SessionStatus={"Status": "Aborted", "Started": "Started"})
+    assert session_is_running(aborted, now=datetime(2026, 10, 23, 16, 30, tzinfo=UTC)) is True
+    assert session_is_running(aborted, now=datetime(2026, 10, 24, 14, 0, tzinfo=UTC)) is False
+
     # With no usable status, the published window decides.
     no_status = dict(finished)
     no_status.pop("SessionStatus")

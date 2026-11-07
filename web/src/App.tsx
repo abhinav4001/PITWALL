@@ -135,6 +135,20 @@ export default function PitWallApp() {
     }
   }, [])
 
+  // The backend switches between the replay and F1's live feed by itself.
+  // Keep the header and map in step with that decision without a reload.
+  useEffect(() => {
+    let cancelled = false
+    const timer = window.setInterval(async () => {
+      const sessionData = await api.currentSession()
+      if (!cancelled && !isUnavailable(sessionData)) setSession(sessionData)
+    }, 5000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [])
+
   // ------------------------------------------------------------- live feed
   useEffect(() => {
     if (view !== 'live') return
