@@ -407,15 +407,27 @@ export default function PitWallApp() {
 
   const circuitFacts = useMemo(() => {
     const meta = (frame?.session_meta ?? {}) as Record<string, unknown>
+    const circuit = String(meta.circuit_short_name ?? session?.circuit ?? 'Austin')
+    const meeting = String(
+      meta.meeting_name ?? session?.meeting_name ?? `${circuit} Grand Prix`,
+    )
     return {
-      circuit: String(meta.circuit_short_name ?? session?.circuit ?? 'Austin'),
+      circuit,
       year: Number(meta.year ?? session?.year ?? 2024),
-      name: String(
-        meta.session_name ?? session?.meeting_name ?? session?.session_type ?? 'Race',
-      ),
+      name: String(meta.session_name ?? session?.session_type ?? 'Race'),
+      meeting,
+      location: String(meta.location ?? session?.location ?? ''),
       start: String(meta.date_start ?? ''),
     }
   }, [frame, session])
+
+  const meetingWords = useMemo(() => {
+    const words = circuitFacts.meeting.split(/\s+/).filter(Boolean)
+    if (words.length <= 2) {
+      return { lead: words.slice(0, -1).join(' '), tail: words.slice(-1).join(' ') }
+    }
+    return { lead: words.slice(0, -2).join(' '), tail: words.slice(-2).join(' ') }
+  }, [circuitFacts.meeting])
 
   const onSelectDriver = useCallback((driverNumber: number) => {
     setSelectedDriver(driverNumber)
@@ -507,13 +519,25 @@ export default function PitWallApp() {
                 </div>
 
                 <h1 className="font-sans font-black uppercase leading-[0.86] tracking-tight">
-                  <span className="block text-5xl sm:text-7xl text-white">United</span>
-                  <span className="block text-5xl sm:text-7xl text-white">States</span>
-                  <span className="block text-5xl sm:text-7xl text-red-600">Grand Prix</span>
+                  {meetingWords.lead
+                    .split(/\s+/)
+                    .filter(Boolean)
+                    .map((word, index) => (
+                      <span
+                        key={`${word}-${index}`}
+                        className="block text-5xl sm:text-7xl text-white"
+                      >
+                        {word}
+                      </span>
+                    ))}
+                  <span className="block text-5xl sm:text-7xl text-red-600">
+                    {meetingWords.tail}
+                  </span>
                 </h1>
 
                 <p className="text-zinc-400 light:text-zinc-600 font-mono text-sm mt-6 font-semibold max-w-md leading-relaxed">
-                  Circuit of the Americas, Austin • {circuitFacts.year} •{' '}
+                  {circuitFacts.circuit}
+                  {circuitFacts.location ? `, ${circuitFacts.location}` : ''} • {circuitFacts.year} •{' '}
                   {frame?.total_laps
                     ? `${frame.total_laps} laps`
                     : String(circuitFacts.name).toLowerCase()}{' '}

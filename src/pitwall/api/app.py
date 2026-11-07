@@ -415,6 +415,30 @@ class PitWallState:
         self.circuit = self.livetiming.circuit
         self.year = self.livetiming.year
         self._bundle = self._bundle_for(self.circuit, self.year)
+
+        # The replay's outline belongs to the replay's circuit, not to the
+        # live one.  Build the live circuit's real canonical outline so the
+        # map is never labelled with the wrong track.  If it cannot be built,
+        # clear it and let the endpoint say so honestly.
+        meeting = session.get("Meeting") or {}
+        circuit_key = (meeting.get("Circuit") or {}).get("Key")
+        try:
+            outline = resolve_outline(
+                OUTLINE_DIR,
+                self.circuit,
+                self.year,
+                circuit_key=int(circuit_key) if circuit_key is not None else None,
+            )
+        except Exception as exc:  # noqa: BLE001 - live timing must still start
+            logger.warning("could not build live outline for %s: %s", self.circuit, exc)
+            outline = None
+        if outline is not None:
+            self.outline = outline.to_dict()
+            self.projection = TrackProjection.from_outline(outline.points)
+        else:
+            self.outline = None
+            self.projection = None
+
         self._rebuild_live_geometry()
         # Rebuild the tick loop so it drives the live source, carrying the
         # open browsers across - otherwise the page keeps receiving the
@@ -481,6 +505,18 @@ class PitWallState:
         trace = source.trace()
         if bounds is None or len(trace) < 10:
             self._live_trace = []
+            # Put the canonical outline back on its own projection.  The
+            # live trace uses F1's internal coordinate frame, which is not
+            # the same frame as the FastF1/OpenF1 outline.
+            if self.outline:
+                points = [
+                    (float(p["x"]), float(p["y"]))
+                    for p in self.outline.get("points") or []
+                ]
+                if points:
+                    self.projection = TrackProjection.from_outline(points)
+                    if self.loop is not None:
+                        self.loop.projection = self.projection
             return
         self._live_trace = trace
         min_x, max_x, min_y, max_y = bounds
@@ -783,15 +819,24 @@ async def current_session() -> dict[str, Any]:
         "mode": state.mode,
     }
     if state.replayer is not None:
+        meta = state.replayer.meta
+        meeting_name = meta.get("meeting_name")
+        if not meeting_name:
+            country = meta.get("country_name")
+            meeting_name = (
+                f"{country} Grand Prix" if country else meta.get("session_name")
+            )
         payload.update(
             {
                 "session_key": state.replayer.session_key,
                 "circuit": state.replayer.circuit,
                 "year": state.replayer.year,
-                "meeting_name": state.replayer.meta.get("session_name"),
-                "session_type": state.replayer.meta.get("session_type"),
-                "date_start": state.replayer.meta.get("date_start"),
-                "date_end": state.replayer.meta.get("date_end"),
+                "meeting_name": meeting_name,
+                "location": meta.get("location"),
+                "session_type": meta.get("session_type"),
+                "session_status": meta.get("status"),
+                "date_start": meta.get("date_start"),
+                "date_end": meta.get("date_end"),
                 "total_laps": getattr(state.replayer, "total_laps", None),
                 "status": "LIVE" if state.mode == "LIVE" else "REPLAY_ACTIVE",
             }

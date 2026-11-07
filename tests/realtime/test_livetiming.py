@@ -572,6 +572,16 @@ def test_a_yellow_flag_is_read_from_the_race_control_messages() -> None:
     assert messages and "YELLOW IN TRACK SECTOR 1" in messages[-1]["message"]
 
 
+def test_an_aborted_session_is_not_shown_as_green() -> None:
+    from pitwall.data.models import FlagState
+
+    adapter = LivetimingLiveAdapter(LivetimingLiveSource())
+    adapter.source._handle(
+        _feed("SessionStatus", {"Status": "Aborted", "Started": "Started"})
+    )
+    assert adapter._flag_state() == FlagState.RED
+
+
 # ----------------------------------------------------------------------
 # the adapter
 # ----------------------------------------------------------------------
@@ -854,6 +864,32 @@ def test_driver_list_is_a_direct_mapping_on_the_live_feed() -> None:
     assert driver["code"] == "VER"
     assert driver["name"] == "Max VERSTAPPEN"
     assert driver["team"] == "Red Bull Racing"
+
+
+def test_live_meta_names_the_real_meeting_and_circuit() -> None:
+    source = LivetimingLiveSource()
+    source._on_SessionInfo(
+        {
+            "Key": 11408,
+            "Name": "Qualifying",
+            "Type": "Qualifying",
+            "SessionStatus": "Started",
+            "StartDate": "2026-11-07T15:00:00",
+            "EndDate": "2026-11-07T16:00:00",
+            "GmtOffset": "-03:00:00",
+            "Meeting": {
+                "Name": "São Paulo Grand Prix",
+                "Location": "São Paulo",
+                "Circuit": {"Key": 14, "ShortName": "Interlagos"},
+                "Country": {"Name": "Brazil"},
+            },
+        }
+    )
+    meta = LivetimingLiveAdapter(source).meta
+    assert meta["meeting_name"] == "São Paulo Grand Prix"
+    assert meta["circuit_short_name"] == "Interlagos"
+    assert meta["location"] == "São Paulo"
+    assert meta["year"] == 2026
 
 
 def test_session_info_string_status_becomes_a_running_status() -> None:

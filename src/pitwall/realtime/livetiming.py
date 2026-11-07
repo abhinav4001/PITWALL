@@ -1235,9 +1235,17 @@ class LivetimingLiveAdapter:
         """Session metadata, in the shape the replay's pack uses."""
         session = self.source.state.session
         status = session.get("SessionStatus") or {}
+        meeting = session.get("Meeting") or {}
+        circuit = meeting.get("Circuit") or {}
+        country = meeting.get("Country") or {}
         return {
             "session_name": self.session_name,
             "session_type": self.session_type,
+            "meeting_name": meeting.get("Name"),
+            "circuit_short_name": circuit.get("ShortName"),
+            "location": meeting.get("Location"),
+            "country_name": country.get("Name"),
+            "year": self.year,
             "date_start": session.get("StartDate"),
             "date_end": session.get("EndDate"),
             "status": status.get("Status") if isinstance(status, dict) else None,
@@ -1272,7 +1280,18 @@ class LivetimingLiveAdapter:
 
     # -- the replay-compatible surface ---------------------------------
     def _flag_state(self) -> FlagState:
-        """The track state, from the race-control messages."""
+        """The track state, from the session and race-control messages."""
+        status = self.source.state.session.get("SessionStatus")
+        if isinstance(status, dict):
+            session_status = str(status.get("Status") or "").strip().lower()
+        else:
+            session_status = str(status or "").strip().lower()
+        if session_status in {"aborted", "cancelled"}:
+            # F1 keeps the timing feed open while a session is stopped.  The
+            # track may be clear, but the session is not running, so green
+            # would be wrong.
+            return FlagState.RED
+
         state = FlagState.GREEN
         for row in self.source.state.messages:
             flag = (row.get("flag") or "").strip().upper()

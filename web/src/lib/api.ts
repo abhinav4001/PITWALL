@@ -127,7 +127,9 @@ export interface CurrentSession {
   circuit?: string
   year?: number
   meeting_name?: string
+  location?: string
   session_type?: string
+  session_status?: string | null
   date_start?: string
   date_end?: string
   total_laps?: number | null
